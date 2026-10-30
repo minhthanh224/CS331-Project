@@ -15,7 +15,7 @@ def gen_cam_resnet_single_class(model: nn.Module, input_tensor: torch.Tensor , c
 
     image = normalize(input_tensor)
     with torch.no_grad():
-        feature_maps = feature_extractor.forward(image)
+        feature_maps = feature_extractor.forward(image) # (B, 512, 8, 8)
         class_weights = model.fc.weight[class_indices]  # (B, 512)
         weights = class_weights[:, :, None, None]  # (B, 512, 1, 1)
         # Nhân chập và cộng tổng theo 512 kênh: (B, 1, 8, 8)
