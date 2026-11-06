@@ -115,7 +115,7 @@ for epoch in range(1, config.num_epochs + 1):
     train_loss = run_epoch(True, train_loader)
     val_loss = run_epoch(False, val_loader)
     print(f"Train loss: {train_loss:.4f} | Val loss: {val_loss:.4f}")
-
+    
     if val_loss < best_loss:
         best_loss = val_loss
         torch.save(model.state_dict(), checkpoint_dir / "best.pt")
