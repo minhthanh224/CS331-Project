@@ -4,7 +4,7 @@ from sklearn.metrics import average_precision_score, f1_score, precision_score, 
 
 
 # =====================================================================
-# BƯỚC 1: METRICS CHO MULTI-LABEL CLASSIFICATION
+# STEP 1: METRICS FOR MULTI-LABEL CLASSIFICATION
 # =====================================================================
 def compute_classification_metrics(targets, probabilities, threshold: float = 0.5):
     if torch.is_tensor(targets):
@@ -53,7 +53,7 @@ def compute_classification_metrics(targets, probabilities, threshold: float = 0.
 
 
 # =====================================================================
-# BƯỚC 2: METRICS CHO SEMANTIC SEGMENTATION (WSSS: CAM / CRF / SAM)
+# STEP 2: METRICS FOR SEMANTIC SEGMENTATION (WSSS: CAM / CRF / SAM)
 # =====================================================================
 class SegmentationEvaluator:
     def __init__(self, num_classes: int = 21, ignore_index: int = 255) -> None:
@@ -78,7 +78,7 @@ class SegmentationEvaluator:
         preds_flat = preds.astype(np.int64).ravel()
         targets_flat = targets.astype(np.int64).ravel()
 
-        # Lọc bỏ các pixel thuộc vùng viền ignore_index (255 trong VOC2012)
+        # Filter out boundary/ambiguous pixels marked with ignore_index (255 in VOC2012)
         valid_mask = (
             (targets_flat != self.ignore_index)
             & (targets_flat >= 0)
