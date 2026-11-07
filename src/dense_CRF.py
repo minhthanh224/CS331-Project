@@ -88,7 +88,18 @@ def dense_crf_pytorch(
     return Q.squeeze(0).cpu().numpy()
 
 
-def get_dense_crf_mask(image_rgb: np.ndarray, cams: np.ndarray, class_indices, alpha: float = 4.0) -> np.ndarray:
+def get_dense_crf_mask(
+    image_rgb: np.ndarray,
+    cams: np.ndarray,
+    class_indices,
+    alpha: float = 4.0,
+    n_iters: int = 5,
+    sxy_gauss: float = 3.0,
+    compat_gauss: float = 3.0,
+    sxy_bi: float = 50.0,
+    srgb_bi: float = 13.0,
+    compat_bi: float = 10.0,
+) -> np.ndarray:
     class_indices = np.asarray(class_indices)
     if cams.ndim == 2:
         cams = np.expand_dims(cams, axis=0)
@@ -102,7 +113,16 @@ def get_dense_crf_mask(image_rgb: np.ndarray, cams: np.ndarray, class_indices, a
     cams = np.clip(cams, 1e-6, 1.0)
     cams = cams / np.sum(cams, axis=0, keepdims=True)
 
-    Q = dense_crf_pytorch(image_rgb=image_rgb, probs=cams)
+    Q = dense_crf_pytorch(
+        image_rgb=image_rgb,
+        probs=cams,
+        n_iters=n_iters,
+        sxy_gauss=sxy_gauss,
+        compat_gauss=compat_gauss,
+        sxy_bi=sxy_bi,
+        srgb_bi=srgb_bi,
+        compat_bi=compat_bi,
+    )
 
     best_k = np.argmax(Q, axis=0).reshape((H, W))
 

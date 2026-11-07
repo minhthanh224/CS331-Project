@@ -13,10 +13,9 @@ class TrainConfig:
     num_workers: int = 0
 
     def __post_init__(self) -> None:
+        if self.model_name not in {"resnet18", "resnet50", "resnet101"}:
+            raise ValueError("model_name must be resnet18, resnet50, or resnet101")
         self.voc_root = Path(self.voc_root)
-
-        if self.model_name not in {"resnet18", "resnet50"}:
-            raise ValueError("model_name must be resnet18 or resnet50")
 
         if self.image_size < 32:
             raise ValueError("image_size must be at least 32")

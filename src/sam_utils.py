@@ -46,6 +46,12 @@ def gen_sam_pseudo_mask(
     min_area: int = 25,
     max_components: int = 3,
     box_pad: int = 16,
+    encode_image: bool = True,
+    w_cam_iou: float = 0.50,
+    w_core_recall: float = 0.35,
+    w_sam_iou: float = 0.25,
+    w_bg_spill: float = 0.45,
+    cam_pixel_weight: float = 0.55,
 ) -> np.ndarray:
     """Generate a pseudo-mask using CAM + SAM (Approach 1: Connected Components + Multi-mask):
     1. Split active CAM regions of each class into connected components.
@@ -60,7 +66,8 @@ def gen_sam_pseudo_mask(
         image_uint8 = (image_rgb * 255).astype(np.uint8)
     else:
         image_uint8 = image_rgb.astype(np.uint8)
-    predictor.set_image(image_uint8)
+    if encode_image:
+        predictor.set_image(image_uint8)
 
     H, W = image_uint8.shape[:2]
     pseudo_mask = np.zeros((H, W), dtype=np.int64)
@@ -163,10 +170,10 @@ def gen_sam_pseudo_mask(
 
                 # Composite score for selecting the optimal mask candidate
                 total_score = (
-                    0.50 * cam_iou
-                    + 0.35 * core_recall
-                    + 0.25 * float(iou_preds[m_idx])
-                    - 0.45 * bg_spill
+                    w_cam_iou * cam_iou
+                    + w_core_recall * core_recall
+                    + w_sam_iou * float(iou_preds[m_idx])
+                    - w_bg_spill * bg_spill
                 )
                 if total_score > best_m_score:
                     best_m_score = total_score
@@ -177,7 +184,7 @@ def gen_sam_pseudo_mask(
         # 4. Assign class label to pseudo_mask using combined pixel CAM and mean mask confidence
         if class_mask_k.any():
             mean_mask_cam = float(cam_k[class_mask_k].mean())
-            combined_score = 0.55 * cam_k + 0.45 * mean_mask_cam
+            combined_score = cam_pixel_weight * cam_k + (1.0 - cam_pixel_weight) * mean_mask_cam
             update_region = class_mask_k & (combined_score >= best_scores)
             pseudo_mask[update_region] = voc_class_id
             best_scores[update_region] = combined_score[update_region]

@@ -4,6 +4,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm.auto import tqdm
+import argparse
 
 #Modules from src
 from src.config import TrainConfig
@@ -21,16 +22,29 @@ CLASSES = (
 voc_root = Path.cwd() / "data" / "VOC2012"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train multi-label classifier for WSSS CAM")
+    parser.add_argument("--model", type=str, default="resnet18", choices=["resnet18", "resnet50", "resnet101"], help="Backbone model name")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--image-size", type=int, default=244, help="Input image size")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader num_workers")
+    return parser.parse_args()
+args = parse_args()
+
 config = TrainConfig(
     voc_root=voc_root,
-    model_name="resnet18",
-    image_size=244,
-    batch_size=8,
-    num_epochs=3,
-    learning_rate=1e-4,
-    seed=42,
-    num_workers=0
+    model_name=args.model,
+    image_size=args.image_size,
+    batch_size=args.batch_size,
+    num_epochs=args.epochs,
+    learning_rate=args.lr,
+    seed=args.seed,
+    num_workers=args.num_workers,
 )
+print(f"Training config: model={config.model_name} | image_size={config.image_size} | epochs={config.num_epochs} | batch_size={config.batch_size} | lr={config.learning_rate}")
 
 split_dir = config.voc_root / "ImageSets" / "Segmentation"
 train_ids = (split_dir / "train.txt").read_text().split()
@@ -107,7 +121,7 @@ def run_epoch(is_training: bool, loader: DataLoader):
     return total_loss / total_images
 
 best_loss = float("inf")
-checkpoint_dir = Path("checkpoints")
+checkpoint_dir = Path("checkpoints") / config.model_name
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
 for epoch in range(1, config.num_epochs + 1):

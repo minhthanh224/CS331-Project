@@ -5,9 +5,17 @@ from torchvision import transforms
 import torch.nn.functional as F
 import numpy as np
 
-def gen_cam_resnet(model: nn.Module, input_tensor: torch.Tensor , class_indices, target_size = None):
+def gen_cam_resnet(
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    class_indices,
+    target_size=None,
+    scales: tuple[float, ...] = (1.0,),
+    hflip: bool = False,
+):
     """
     Generate Class Activation Maps (CAM) for a ResNet model.
+    Supports optional Multi-scale + Horizontal Flip Test-Time Augmentation (TTA).
 
     Supports two broadcasting modes:
     1. Multi-class on a single image:
@@ -27,44 +35,51 @@ def gen_cam_resnet(model: nn.Module, input_tensor: torch.Tensor , class_indices,
     std = [0.229, 0.224, 0.225]
 
     # If a single image (3, H, W) is passed, add a batch dimension -> (1, 3, H, W)
-    if(input_tensor).dim() == 3:
+    if input_tensor.dim() == 3:
         input_tensor = input_tensor.unsqueeze(0)
 
     normalize = transforms.Normalize(mean=mean, std=std)
-
     image = normalize(input_tensor)
-    with torch.no_grad():
-        # Extract spatial feature maps from the last conv block: (B, C, h, w), e.g., (B, 512, 8, 8)
-        feature_maps = feature_extractor.forward(image)
 
+    # Default output resolution to the input image's (H, W) if target_size is not specified
+    orig_h, orig_w = image.shape[-2:]
+    if target_size is None:
+        target_size = (orig_h, orig_w)
+
+    with torch.no_grad():
         # Get classifier weights for the target classes: (K, C) or (B, C)
         class_weights = model.fc.weight[class_indices]
-
         # Reshape weights to (K, C, 1, 1) or (B, C, 1, 1) for spatial broadcasting
         weights = class_weights[:, :, None, None]
 
-        # Compute weighted sum across the channel dimension (dim=1):
-        # - If B=1 and K classes: (1, C, h, w) * (K, C, 1, 1) -> summed to (K, 1, h, w)
-        # - If B images and B classes: (B, C, h, w) * (B, C, 1, 1) -> summed to (B, 1, h, w)
-        raw_cam = (feature_maps * weights).sum(dim=1, keepdim=True)
+        accum_cam = None
+        for s in scales:
+            if s == 1.0:
+                scaled_img = image
+            else:
+                sh = max(32, int(round(orig_h * s)))
+                sw = max(32, int(round(orig_w * s)))
+                scaled_img = F.interpolate(image, size=(sh, sw), mode="bilinear", align_corners=False)
 
-        # Keep only positive activations that positively contribute to the target class
-        cam = torch.relu(raw_cam)
+            # Forward original orientation at scale s
+            fmap = feature_extractor(scaled_img)
+            cam_s = torch.relu((fmap * weights).sum(dim=1, keepdim=True))
+            cam_s = F.interpolate(cam_s, size=target_size, mode="bilinear", align_corners=False).squeeze(1)
+            cam_s = cam_s / cam_s.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+            accum_cam = cam_s if accum_cam is None else (accum_cam + cam_s)
 
-    # Default output resolution to the input image's (H, W) if target_size is not specified
-    if target_size is None:
-        target_size = image.shape[-2:]
+            # Optional Horizontal Flip TTA at scale s
+            if hflip:
+                flipped_img = torch.flip(scaled_img, dims=[-1])
+                fmap_f = feature_extractor(flipped_img)
+                cam_f = torch.relu((fmap_f * weights).sum(dim=1, keepdim=True))
+                cam_f = torch.flip(cam_f, dims=[-1])
+                cam_f = F.interpolate(cam_f, size=target_size, mode="bilinear", align_corners=False).squeeze(1)
+                cam_f = cam_f / cam_f.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+                accum_cam = accum_cam + cam_f
 
-    # Upsample low-resolution CAM (h, w) back to target_size (H, W) and remove channel dim -> (K, H, W) or (B, H, W)
-    cam = F.interpolate(
-        cam, 
-        size=target_size, 
-        mode="bilinear", 
-        align_corners=False
-    ).squeeze(1)
-    
-    # Min-max normalize each heatmap independently to [0, 1] (clamp_min prevents division by zero)
-    cam = cam / cam.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+        # Min-max normalize the aggregated multi-scale heatmap independently to [0, 1]
+        cam = accum_cam / accum_cam.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
 
     return cam
 
