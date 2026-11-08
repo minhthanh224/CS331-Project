@@ -83,6 +83,115 @@ def gen_cam_resnet(
 
     return cam
 
+
+def _layercam_single_pass(
+    model: nn.Module,
+    image: torch.Tensor,
+    class_indices: torch.Tensor,
+    layers: tuple[str, ...],
+    target_size,
+    shallow_gamma: float,
+) -> torch.Tensor:
+    """Run one forward/backward pass and return the fused LayerCAM: (N, H, W) in [0, 1]."""
+    # Multi-class on a single image: replicate the image so each copy back-propagates one class
+    num_targets = class_indices.numel()
+    if image.shape[0] == 1 and num_targets > 1:
+        image = image.expand(num_targets, -1, -1, -1)
+
+    # Capture feature maps of the selected stages with forward hooks
+    activations = {}
+    hooks = []
+    for name in layers:
+        module = getattr(model, name)
+        hooks.append(module.register_forward_hook(
+            lambda _m, _inp, out, key=name: activations.__setitem__(key, out)
+        ))
+
+    try:
+        with torch.enable_grad():
+            logits = model(image)                                  # (N, num_classes)
+            # Sum of target-class scores; samples are independent (BatchNorm in eval mode)
+            score = logits.gather(1, class_indices.view(-1, 1)).sum()
+            feats = [activations[name] for name in layers]
+            # torch.autograd.grad avoids accumulating gradients into model parameters
+            grads = torch.autograd.grad(score, feats)
+    finally:
+        for h in hooks:
+            h.remove()
+
+    fused = None
+    for name, A, g in zip(layers, feats, grads):
+        # LayerCAM: pixel-wise weights = ReLU(gradient), then M = ReLU(sum_k w_k * A_k)
+        cam_l = torch.relu((torch.relu(g) * A).sum(dim=1, keepdim=True)).detach()
+        cam_l = F.interpolate(cam_l, size=target_size, mode="bilinear", align_corners=False).squeeze(1)
+        cam_l = cam_l / cam_l.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+
+        # Shallow stages have weak responses: rescale with tanh(gamma * M / max(M))
+        if name != "layer4":
+            cam_l = torch.tanh(shallow_gamma * cam_l)
+            cam_l = cam_l / cam_l.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+
+        # Fuse stages by element-wise maximum
+        fused = cam_l if fused is None else torch.maximum(fused, cam_l)
+
+    return fused
+
+
+def gen_layercam_resnet(
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    class_indices,
+    target_size=None,
+    layers: tuple[str, ...] = ("layer4",),
+    scales: tuple[float, ...] = (1.0,),
+    hflip: bool = False,
+    shallow_gamma: float = 2.0,
+):
+    """
+    Generate LayerCAM heatmaps (Jiang et al., TIP 2021) for a ResNet model.
+    Same broadcasting modes and TTA options as gen_cam_resnet:
+    1. Multi-class on a single image: input (3, H, W) or (1, 3, H, W), class_indices (K,) -> (K, H, W)
+    2. Single-class per image on a batch: input (B, 3, H, W), class_indices (B,) -> (B, H, W)
+
+    layers: ResNet stages to use, e.g. ("layer4",) or ("layer3", "layer4") or ("layer2", "layer3", "layer4").
+    shallow_gamma: tanh scaling factor applied to shallow stages before fusion.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+
+    if input_tensor.dim() == 3:
+        input_tensor = input_tensor.unsqueeze(0)
+    input_tensor = input_tensor.to(device)
+
+    class_indices = torch.as_tensor(class_indices, dtype=torch.long, device=device).view(-1)
+
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    image = normalize(input_tensor)
+
+    orig_h, orig_w = image.shape[-2:]
+    if target_size is None:
+        target_size = (orig_h, orig_w)
+
+    accum_cam = None
+    for s in scales:
+        if s == 1.0:
+            scaled_img = image
+        else:
+            sh = max(32, int(round(orig_h * s)))
+            sw = max(32, int(round(orig_w * s)))
+            scaled_img = F.interpolate(image, size=(sh, sw), mode="bilinear", align_corners=False)
+
+        cam_s = _layercam_single_pass(model, scaled_img, class_indices, layers, target_size, shallow_gamma)
+        accum_cam = cam_s if accum_cam is None else (accum_cam + cam_s)
+
+        if hflip:
+            flipped_img = torch.flip(scaled_img, dims=[-1])
+            cam_f = _layercam_single_pass(model, flipped_img, class_indices, layers, target_size, shallow_gamma)
+            accum_cam = accum_cam + torch.flip(cam_f, dims=[-1])
+
+    cam = accum_cam / accum_cam.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    return cam
+
 # def get_bg_score(cams, alpha)
 
 def gen_cam_pseudo_mask(cams, class_indices, cam_threshhold: float = 0.25) -> np.ndarray:
