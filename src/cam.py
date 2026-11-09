@@ -5,6 +5,8 @@ from torchvision import transforms
 import torch.nn.functional as F
 import numpy as np
 
+from .constants import IMAGENET_MEAN, IMAGENET_STD
+
 def gen_cam_resnet(
     model: nn.Module,
     input_tensor: torch.Tensor,
@@ -30,15 +32,12 @@ def gen_cam_resnet(
     # Remove the last two layers (avgpool and fc) to extract convolutional feature maps
     feature_extractor = nn.Sequential(*list(model.children())[:-2]).eval()
 
-    # ImageNet normalization parameters required by pretrained ResNet
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
-
     # If a single image (3, H, W) is passed, add a batch dimension -> (1, 3, H, W)
     if input_tensor.dim() == 3:
         input_tensor = input_tensor.unsqueeze(0)
 
-    normalize = transforms.Normalize(mean=mean, std=std)
+    # ImageNet normalization parameters required by pretrained ResNet
+    normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
     image = normalize(input_tensor)
 
     # Default output resolution to the input image's (H, W) if target_size is not specified
@@ -165,7 +164,7 @@ def gen_layercam_resnet(
 
     class_indices = torch.as_tensor(class_indices, dtype=torch.long, device=device).view(-1)
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
     image = normalize(input_tensor)
 
     orig_h, orig_w = image.shape[-2:]
@@ -194,7 +193,14 @@ def gen_layercam_resnet(
 
 # def get_bg_score(cams, alpha)
 
-def gen_cam_pseudo_mask(cams, class_indices, cam_threshhold: float = 0.25) -> np.ndarray:
+def gen_cam_pseudo_mask(
+    cams,
+    class_indices,
+    cam_threshhold: float = 0.25,
+    cam_threshold: float | None = None,
+) -> np.ndarray:
+    if cam_threshold is not None:
+        cam_threshhold = cam_threshold
     if torch.is_tensor(cams):
         cams = cams.detach().cpu().numpy()
     else:
@@ -212,3 +218,51 @@ def gen_cam_pseudo_mask(cams, class_indices, cam_threshhold: float = 0.25) -> np
 
     pseudo_mask = np.where(max_cam >= cam_threshhold, voc_class_ids[best_k], 0)
     return pseudo_mask.astype(np.int64)
+
+
+def select_active_classes(probs, threshold: float = 0.5) -> np.ndarray:
+    """Classes whose probability >= threshold; falls back to the single top class when none pass.
+
+    probs: (num_classes,) tensor or array of sigmoid probabilities for ONE image.
+    Returns an int64 array of class indices (never empty).
+    """
+    if torch.is_tensor(probs):
+        probs = probs.detach().cpu().numpy()
+    probs = np.asarray(probs)
+    active = np.where(probs >= threshold)[0]
+    if len(active) == 0:
+        active = np.array([int(probs.argmax())], dtype=np.int64)
+    return active.astype(np.int64)
+
+
+def compute_cams(
+    model: nn.Module,
+    img_tensor: torch.Tensor,
+    class_indices,
+    method: str = "cam",
+    scales: tuple[float, ...] = (1.0,),
+    hflip: bool = False,
+    layers: tuple[str, ...] = ("layer4",),
+    shallow_gamma: float = 2.0,
+) -> np.ndarray:
+    """Single entry point for CAM / LayerCAM on one image: returns a NumPy array (K, H, W) in [0, 1].
+
+    Handles the device transfer and class-index conversion that every caller used to repeat.
+    method: "cam" (classic CAM) or "layercam" (uses `layers` and `shallow_gamma`).
+    """
+    device = next(model.parameters()).device
+    if img_tensor.dim() == 3:
+        img_tensor = img_tensor.unsqueeze(0)
+    img_tensor = img_tensor.to(device, non_blocking=True)
+    class_idx = torch.as_tensor(class_indices, dtype=torch.long, device=device).view(-1)
+
+    if method == "cam":
+        cams = gen_cam_resnet(model, img_tensor, class_idx, scales=scales, hflip=hflip)
+    elif method == "layercam":
+        cams = gen_layercam_resnet(
+            model, img_tensor, class_idx,
+            layers=layers, scales=scales, hflip=hflip, shallow_gamma=shallow_gamma,
+        )
+    else:
+        raise ValueError(f"method must be 'cam' or 'layercam', got: {method}")
+    return cams.detach().cpu().numpy()

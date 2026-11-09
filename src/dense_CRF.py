@@ -100,7 +100,14 @@ def get_dense_crf_mask(
     srgb_bi: float = 13.0,
     compat_bi: float = 10.0,
 ) -> np.ndarray:
-    class_indices = np.asarray(class_indices)
+    if torch.is_tensor(cams):
+        cams = cams.detach().cpu().numpy()
+    else:
+        cams = np.asarray(cams)
+    if torch.is_tensor(class_indices):
+        class_indices = class_indices.detach().cpu().numpy()
+    else:
+        class_indices = np.asarray(class_indices)
     if cams.ndim == 2:
         cams = np.expand_dims(cams, axis=0)
 

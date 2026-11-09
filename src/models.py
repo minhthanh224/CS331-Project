@@ -31,3 +31,24 @@ def build_classifier(
             block.downsample[0].stride = (1, 1)
     model.fc = nn.Linear(in_features=model.fc.in_features, out_features=num_classes)
     return model
+
+
+def load_classifier(
+    model_name: str,
+    checkpoint_path,
+    device="cpu",
+    num_classes: int = 20,
+    layer4_stride1: bool = False,
+) -> nn.Module:
+    """Build a classifier, load a checkpoint into it and return it in eval mode on `device`.
+
+    Accepts both a plain state_dict file and a training payload with a "model_state_dict" key.
+    """
+    import torch
+
+    model = build_classifier(model_name, num_classes=num_classes, layer4_stride1=layer4_stride1)
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+    model.load_state_dict(state)
+    return model.to(device).eval()

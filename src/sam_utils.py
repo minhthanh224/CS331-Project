@@ -1,6 +1,92 @@
+from __future__ import annotations
+
+import shutil
 from collections import deque
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 import numpy as np
-from segment_anything import SamPredictor
+
+if TYPE_CHECKING:  # segment_anything is only needed at runtime by build_sam_predictor
+    from segment_anything import SamPredictor
+
+# model type -> (checkpoint file name, download URL, minimum valid size in bytes)
+SAM_MODEL_SPECS = {
+    "vit_b": (
+        "sam_vit_b_01ec64.pth",
+        "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+        350_000_000,
+    ),
+    "vit_l": (
+        "sam_vit_l_0b3195.pth",
+        "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
+        1_150_000_000,
+    ),
+    "vit_h": (
+        "sam_vit_h_4b8939.pth",
+        "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+        2_400_000_000,
+    ),
+}
+
+
+def ensure_sam_checkpoint(model_type: str, target_dir, cache_dirs=()) -> Path:
+    """Return the path of a complete SAM checkpoint inside `target_dir`, fetching it if needed.
+
+    Order: reuse a complete local file -> copy from the first complete file found in `cache_dirs`
+    (e.g. Google Drive) -> download. Incomplete files (smaller than the expected size) are removed.
+    """
+    from torchvision.datasets.utils import download_url
+
+    file_name, url, min_bytes = SAM_MODEL_SPECS[model_type]
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    local_path = target_dir / file_name
+
+    if local_path.is_file() and local_path.stat().st_size < min_bytes:
+        print(f"{file_name} is incomplete, downloading again...")
+        local_path.unlink()
+    if local_path.is_file():
+        return local_path
+
+    for cache_dir in cache_dirs:
+        cached = Path(cache_dir) / file_name
+        if cached.is_file() and cached.stat().st_size >= min_bytes:
+            print(f"Copying SAM ({model_type}) checkpoint from {cached.parent}...")
+            shutil.copy2(cached, local_path)
+            return local_path
+
+    print(f"Downloading SAM ({model_type}) checkpoint ({file_name})...")
+    download_url(url, str(target_dir), filename=file_name)
+    if local_path.stat().st_size < min_bytes:
+        raise RuntimeError(f"SAM checkpoint {file_name} was not downloaded completely!")
+    return local_path
+
+
+def build_sam_predictor(model_type: str, checkpoint_path, device) -> "SamPredictor":
+    """Load a SAM model from `checkpoint_path`, move it to `device` (eval mode) and wrap it in a SamPredictor."""
+    from segment_anything import SamPredictor, sam_model_registry
+
+    sam = sam_model_registry[model_type](checkpoint=str(checkpoint_path))
+    sam.to(device=device).eval()
+    return SamPredictor(sam)
+
+
+def get_sam_embedding(predictor: "SamPredictor") -> dict:
+    """Snapshot the image embedding of the image last passed to predictor.set_image() (stored on CPU)."""
+    return {
+        "features_cpu": predictor.features.detach().cpu(),
+        "original_size": predictor.original_size,
+        "input_size": predictor.input_size,
+    }
+
+
+def set_sam_embedding(predictor: "SamPredictor", embedding: dict, device) -> None:
+    """Restore an embedding saved by get_sam_embedding so predictor.predict() works without re-encoding."""
+    predictor.features = embedding["features_cpu"].to(device, non_blocking=True)
+    predictor.original_size = embedding["original_size"]
+    predictor.input_size = embedding["input_size"]
+    predictor.is_image_set = True
 
 
 def _connected_components_2d(binary_mask: np.ndarray) -> tuple[np.ndarray, int]:
@@ -100,6 +186,8 @@ def gen_sam_pseudo_mask(
         # Fallback if no component passes the filter: use the global peak region of cam_k
         if len(valid_comps) == 0:
             fallback_mask = cam_k >= max(low_threshold, 0.5 * global_max)
+            if not fallback_mask.any():
+                continue
             valid_comps = [(int(fallback_mask.sum()), global_max, fallback_mask)]
 
         class_mask_k = np.zeros((H, W), dtype=bool)
