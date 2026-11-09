@@ -5,13 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Union
 
-
-VOC_CLASSES = (
-    "aeroplane", "bicycle", "bird", "boat", "bottle",
-    "bus", "car", "cat", "chair", "cow",
-    "diningtable", "dog", "horse", "motorbike", "person",
-    "pottedplant", "sheep", "sofa", "train", "tvmonitor",
-)
+from .constants import VOC_CLASSES  # re-exported: `from src.logger import VOC_CLASSES` keeps working
 
 
 def _serialize_config(config: Any) -> Dict[str, Any]:
@@ -167,3 +161,91 @@ def log_eval_results(
         "markdown": md_path,
     }
 
+
+
+# =====================================================================
+# Console printing and summary-table rows (previously copy-pasted in every notebook)
+# =====================================================================
+_SEG_ROW_FIELDS = (
+    # (metric key, short label for percent=False, label for percent=True)
+    ("mIoU", "mIoU", "mIoU (%)"),
+    ("foreground_mIoU", "Fg mIoU", "Fg mIoU (%)"),
+    ("mean_dice", "Mean Dice", "Mean Dice (%)"),
+    ("pixel_accuracy", "Pixel Acc", "Pixel Acc (%)"),
+    ("mean_precision", "Precision", "Precision (%)"),
+    ("mean_recall", "Recall", "Recall (%)"),
+)
+
+_CLS_ROW_FIELDS = (
+    ("mAP", "mAP", "mAP (%)"),
+    ("macro_f1", "Macro F1", "Macro F1 (%)"),
+    ("micro_f1", "Micro F1", "Micro F1 (%)"),
+    ("macro_precision", "Macro Precision", "Macro Precision (%)"),
+    ("macro_recall", "Macro Recall", "Macro Recall (%)"),
+    ("exact_match", "Exact Match", "Exact Match (%)"),
+)
+
+
+def _metrics_row(metrics: Dict[str, Any], fields, percent: bool, extra: Dict[str, Any]) -> Dict[str, Any]:
+    row = dict(extra)
+    for key, short_label, percent_label in fields:
+        value = float(metrics[key])
+        if percent:
+            row[percent_label] = round(value * 100, 2)
+        else:
+            row[short_label] = round(value, 4)
+    return row
+
+
+def seg_summary_row(metrics: Dict[str, Any], percent: bool = True, **extra: Any) -> Dict[str, Any]:
+    """One comparison-table row for segmentation metrics; `extra` (e.g. Backbone=..., Method=...) come first.
+
+    percent=True -> columns like "mIoU (%)" rounded to 2 decimals; False -> "mIoU" rounded to 4 decimals.
+    """
+    return _metrics_row(metrics, _SEG_ROW_FIELDS, percent, extra)
+
+
+def cls_summary_row(metrics: Dict[str, Any], percent: bool = True, **extra: Any) -> Dict[str, Any]:
+    """One comparison-table row for multi-label classification metrics (see seg_summary_row)."""
+    return _metrics_row(metrics, _CLS_ROW_FIELDS, percent, extra)
+
+
+def print_seg_metrics(
+    metrics: Dict[str, Any],
+    title: str = "SEGMENTATION RESULTS",
+    classes: Sequence[str] = VOC_CLASSES,
+    per_class: bool = False,
+) -> None:
+    print(f"=== {title} ===")
+    print(f"mIoU (all classes incl. background) : {metrics['mIoU']:.4f}")
+    print(f"Foreground mIoU (object classes)    : {metrics['foreground_mIoU']:.4f}")
+    print(f"Mean Dice (Pixel F1)                : {metrics['mean_dice']:.4f}")
+    print(f"Pixel Accuracy (PA)                 : {metrics['pixel_accuracy']:.2%}")
+    print(f"Mean Pixel Accuracy (mPA)           : {metrics['mean_pixel_accuracy']:.4f}")
+    print(f"Mean Pixel Precision                : {metrics['mean_precision']:.4f}")
+    print(f"Mean Pixel Recall                   : {metrics['mean_recall']:.4f}")
+    if per_class and "iou_per_class" in metrics:
+        print("\nPer-class IoU:")
+        for name, value in zip(("background", *classes), metrics["iou_per_class"]):
+            print(f"- {name:15s}: {value:.4f}")
+
+
+def print_cls_metrics(
+    metrics: Dict[str, Any],
+    title: str = "MULTI-LABEL CLASSIFICATION RESULTS",
+    classes: Sequence[str] = VOC_CLASSES,
+    per_class: bool = False,
+) -> None:
+    print(f"=== {title} ===")
+    print(f"mAP             : {metrics['mAP']:.4f}")
+    print(f"Macro F1        : {metrics['macro_f1']:.4f}")
+    print(f"Micro F1        : {metrics['micro_f1']:.4f}")
+    print(f"Macro Precision : {metrics['macro_precision']:.4f}")
+    print(f"Micro Precision : {metrics['micro_precision']:.4f}")
+    print(f"Macro Recall    : {metrics['macro_recall']:.4f}")
+    print(f"Micro Recall    : {metrics['micro_recall']:.4f}")
+    print(f"Exact Match     : {metrics['exact_match']:.2%}")
+    if per_class and "ap_per_class" in metrics:
+        print("\nPer-class AP:")
+        for name, value in zip(classes, metrics["ap_per_class"]):
+            print(f"- {name:15s}: {value:.4f}")
