@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from .constants import SUPPORTED_BACKBONES
+
 @dataclass
 class TrainConfig:
     voc_root : Path
@@ -13,7 +15,7 @@ class TrainConfig:
     num_workers: int = 0
 
     def __post_init__(self) -> None:
-        if self.model_name not in {"resnet18", "resnet50", "resnet101"}:
+        if self.model_name not in SUPPORTED_BACKBONES:
             raise ValueError("model_name must be resnet18, resnet50, or resnet101")
         self.voc_root = Path(self.voc_root)
 
