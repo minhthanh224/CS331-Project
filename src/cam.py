@@ -204,12 +204,17 @@ def ensure_cam_size(cams: np.ndarray, target_size: tuple[int, int] | None) -> np
         if squeeze_2d:
             cams_t = cams_t.unsqueeze(0)
         if target_size is not None and tuple(cams_t.shape[-2:]) != tuple(target_size):
+            added_batch = cams_t.dim() < 4
+            if added_batch:
+                cams_t = cams_t.unsqueeze(0)
             cams_t = F.interpolate(
-                cams_t.unsqueeze(0).float(),
+                cams_t.float(),
                 size=tuple(target_size),
                 mode="bilinear",
                 align_corners=False,
-            ).squeeze(0)
+            )
+            if added_batch:
+                cams_t = cams_t.squeeze(0)
             cams_t = cams_t.clamp(0.0, 1.0)
         out = cams_t.cpu().numpy()
         return out[0] if squeeze_2d else out
@@ -221,13 +226,19 @@ def ensure_cam_size(cams: np.ndarray, target_size: tuple[int, int] | None) -> np
     if target_size is None or cams_np.shape[-2:] == tuple(target_size):
         return cams_np[0] if squeeze_2d else cams_np
 
-    cams_t = torch.from_numpy(cams_np).unsqueeze(0)
+    cams_t = torch.from_numpy(cams_np)
+    added_batch = cams_t.dim() < 4
+    if added_batch:
+        cams_t = cams_t.unsqueeze(0)
     resized = F.interpolate(
         cams_t,
         size=tuple(target_size),
         mode="bilinear",
         align_corners=False,
-    ).squeeze(0).clamp_(0.0, 1.0).numpy()
+    )
+    if added_batch:
+        resized = resized.squeeze(0)
+    resized = resized.clamp_(0.0, 1.0).numpy()
     return resized[0] if squeeze_2d else resized
 
 
