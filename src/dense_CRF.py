@@ -2,6 +2,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .cam import ensure_cam_size
+
 def _compute_kernel_weights(
     img: torch.Tensor,
     kernel_size: int,
@@ -100,10 +102,8 @@ def get_dense_crf_mask(
     srgb_bi: float = 13.0,
     compat_bi: float = 10.0,
 ) -> np.ndarray:
-    if torch.is_tensor(cams):
-        cams = cams.detach().cpu().numpy()
-    else:
-        cams = np.asarray(cams)
+    H, W, _ = image_rgb.shape
+    cams = ensure_cam_size(cams, (H, W))
     if torch.is_tensor(class_indices):
         class_indices = class_indices.detach().cpu().numpy()
     else:
@@ -114,8 +114,6 @@ def get_dense_crf_mask(
     bg_score = (1.0 - cams.max(axis=0, keepdims=True)) ** alpha
     cams = np.concatenate([bg_score, cams], axis=0)
     class_indices = class_indices + 1
-
-    H, W, _ = image_rgb.shape
 
     cams = np.clip(cams, 1e-6, 1.0)
     cams = cams / np.sum(cams, axis=0, keepdims=True)
