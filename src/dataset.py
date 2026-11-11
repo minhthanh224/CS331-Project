@@ -32,6 +32,23 @@ def read_split_ids(voc_root: Path, group: str, split: str) -> list[str]:
     return (Path(voc_root) / "ImageSets" / group / f"{split}.txt").read_text().split()
 
 
+def read_wsss_train_ids(voc_root: Path, train_split: str = "main_trainval") -> list[str]:
+    """Return classifier training image IDs strictly disjoint from Segmentation/val.txt.
+
+    - "main_trainval": ImageSets/Main/trainval.txt minus ImageSets/Segmentation/val.txt (10,418 images).
+    - "seg_train": ImageSets/Segmentation/train.txt (1,464 images).
+    """
+    voc_root = Path(voc_root)
+    val_id_set = set(read_split_ids(voc_root, "Segmentation", "val"))
+    if train_split == "main_trainval":
+        main_ids = read_split_ids(voc_root, "Main", "trainval")
+        return [img_id for img_id in main_ids if img_id not in val_id_set]
+    if train_split == "seg_train":
+        seg_ids = read_split_ids(voc_root, "Segmentation", "train")
+        return [img_id for img_id in seg_ids if img_id not in val_id_set]
+    raise ValueError(f"train_split must be 'main_trainval' or 'seg_train', got: {train_split!r}")
+
+
 def build_transforms(image_size: int, train: bool = False) -> transforms.Compose:
     """Image transforms producing [0, 1] tensors (normalization is applied later by the caller).
 
@@ -87,27 +104,64 @@ def load_gt_mask(voc_root: Path, image_id: str, size: int | tuple[int, int] | No
         return np.array(gt_img, dtype=np.int64)
 
 
-def load_eval_sample(dataset: VOCClassificationDataset, index: int, image_size: int | None = None) -> dict:
+def load_eval_sample(
+    dataset: VOCClassificationDataset,
+    index: int,
+    image_size: int | tuple[int, int] | None = None,
+) -> dict:
     """Load one image together with its segmentation ground truth for evaluation.
 
-    Returns a dict with: idx, img_id, img_tensor (3,H,W in [0,1]), img_rgb (H,W,3 float),
-    img_u8 (H,W,3 uint8) and gt_mask (H,W int64, resized to image_size when given).
+    - `img_tensor` always comes from `dataset[index]` (e.g. resized to 448x448) for CNN forward/CAM.
+    - When `image_size is None` (default, standard Pascal VOC benchmark protocol), `img_rgb`, `img_u8`,
+      and `gt_mask` are loaded at the native image resolution `(H_orig, W_orig)` with no aspect distortion.
+    - When `image_size` is provided (`int` -> `(size, size)`, or `(w, h)` tuple), `img_rgb`, `img_u8`,
+      and `gt_mask` are resized to that target resolution.
     """
     img_tensor, _ = dataset[index]
-    img_rgb = img_tensor.permute(1, 2, 0).numpy()
     img_id = dataset.image_ids[index]
+    image_path = dataset.image_dir / f"{img_id}.jpg"
+
+    if image_size is None:
+        with Image.open(image_path) as source:
+            img_u8 = np.array(source.convert("RGB"), dtype=np.uint8)
+        img_rgb = img_u8.astype(np.float32) / 255.0
+        gt_mask = load_gt_mask(dataset.voc_root, img_id, size=None)
+    else:
+        target_wh = (image_size, image_size) if isinstance(image_size, int) else tuple(image_size)
+        tensor_hw = (img_tensor.shape[-2], img_tensor.shape[-1])
+        if tensor_hw == (target_wh[1], target_wh[0]):
+            img_rgb = img_tensor.permute(1, 2, 0).numpy()
+            img_u8 = to_uint8_image(img_rgb)
+        else:
+            with Image.open(image_path) as source:
+                resized = source.convert("RGB").resize(target_wh, resample=Image.BILINEAR)
+                img_u8 = np.array(resized, dtype=np.uint8)
+            img_rgb = img_u8.astype(np.float32) / 255.0
+        gt_mask = load_gt_mask(dataset.voc_root, img_id, size=target_wh)
+
+    if img_u8.shape[:2] != gt_mask.shape:
+        raise ValueError(
+            f"Image/GT shape mismatch for {img_id}: img_u8={img_u8.shape[:2]} vs gt_mask={gt_mask.shape}"
+        )
+
     return {
         "idx": index,
         "img_id": img_id,
         "img_tensor": img_tensor,
         "img_rgb": img_rgb,
-        "img_u8": to_uint8_image(img_rgb),
-        "gt_mask": load_gt_mask(dataset.voc_root, img_id, image_size),
+        "img_u8": img_u8,
+        "gt_mask": gt_mask,
+        "orig_size": gt_mask.shape,
     }
 
 
-def load_eval_samples(dataset: VOCClassificationDataset, image_size: int | None = None, indices=None, desc: str | None = None) -> list[dict]:
-    """load_eval_sample for many indices (default: the whole dataset), with an optional tqdm bar."""
+def load_eval_samples(
+    dataset: VOCClassificationDataset,
+    image_size: int | tuple[int, int] | None = None,
+    indices=None,
+    desc: str | None = None,
+) -> list[dict]:
+    """load_eval_sample for many indices (default: whole dataset at native image resolution)."""
     from tqdm.auto import tqdm
 
     indices = range(len(dataset)) if indices is None else indices
