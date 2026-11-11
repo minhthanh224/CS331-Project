@@ -75,6 +75,9 @@ class SegmentationEvaluator:
         else:
             targets = np.asarray(targets)
 
+        if preds.shape != targets.shape:
+            raise ValueError(f"Shape mismatch between predicted mask {preds.shape} and GT mask {targets.shape}")
+
         preds_flat = preds.astype(np.int64).ravel()
         targets_flat = targets.astype(np.int64).ravel()
 
