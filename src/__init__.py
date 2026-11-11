@@ -2,6 +2,7 @@
 
 from .cam import (
     compute_cams,
+    ensure_cam_size,
     gen_cam_pseudo_mask,
     gen_cam_resnet,
     gen_layercam_resnet,
@@ -25,6 +26,7 @@ from .dataset import (
     load_gt_mask,
     make_loader,
     read_split_ids,
+    read_wsss_train_ids,
 )
 from .dense_CRF import dense_crf_pytorch, get_dense_crf_mask
 from .engine import (
@@ -111,6 +113,7 @@ __all__ = [
     "build_balanced_tune_table",
     "VOCClassificationDataset",
     "read_split_ids",
+    "read_wsss_train_ids",
     "build_transforms",
     "make_loader",
     "load_gt_mask",
@@ -128,6 +131,7 @@ __all__ = [
     # CAM / DenseCRF / SAM
     "gen_cam_resnet",
     "gen_layercam_resnet",
+    "ensure_cam_size",
     "gen_cam_pseudo_mask",
     "select_active_classes",
     "compute_cams",
