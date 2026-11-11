@@ -193,18 +193,54 @@ def gen_layercam_resnet(
 
 # def get_bg_score(cams, alpha)
 
+def ensure_cam_size(cams: np.ndarray, target_size: tuple[int, int] | None) -> np.ndarray:
+    """Ensure a (K, H, W) or (H, W) CAM array has spatial shape `target_size = (H_t, W_t)`.
+
+    Returns `cams` unchanged when `target_size is None` or spatial dimensions already match.
+    """
+    if torch.is_tensor(cams):
+        cams_t = cams.detach()
+        squeeze_2d = cams_t.dim() == 2
+        if squeeze_2d:
+            cams_t = cams_t.unsqueeze(0)
+        if target_size is not None and tuple(cams_t.shape[-2:]) != tuple(target_size):
+            cams_t = F.interpolate(
+                cams_t.unsqueeze(0).float(),
+                size=tuple(target_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+            cams_t = cams_t.clamp(0.0, 1.0)
+        out = cams_t.cpu().numpy()
+        return out[0] if squeeze_2d else out
+
+    cams_np = np.asarray(cams, dtype=np.float32)
+    squeeze_2d = cams_np.ndim == 2
+    if squeeze_2d:
+        cams_np = cams_np[None, :, :]
+    if target_size is None or cams_np.shape[-2:] == tuple(target_size):
+        return cams_np[0] if squeeze_2d else cams_np
+
+    cams_t = torch.from_numpy(cams_np).unsqueeze(0)
+    resized = F.interpolate(
+        cams_t,
+        size=tuple(target_size),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0).clamp_(0.0, 1.0).numpy()
+    return resized[0] if squeeze_2d else resized
+
+
 def gen_cam_pseudo_mask(
     cams,
     class_indices,
     cam_threshhold: float = 0.25,
     cam_threshold: float | None = None,
+    target_size: tuple[int, int] | None = None,
 ) -> np.ndarray:
     if cam_threshold is not None:
         cam_threshhold = cam_threshold
-    if torch.is_tensor(cams):
-        cams = cams.detach().cpu().numpy()
-    else:
-        cams = np.asarray(cams)
+    cams = ensure_cam_size(cams, target_size)
     if torch.is_tensor(class_indices):
         class_indices = class_indices.detach().cpu().numpy()
     else:
@@ -212,9 +248,9 @@ def gen_cam_pseudo_mask(
     if cams.ndim == 2:
         cams = np.expand_dims(cams, axis=0)
 
-    voc_class_ids = class_indices.astype(np.int64) + 1 #Add 1 to class indices to count for background class
-    max_cam = cams.max(axis=0) #Get max cam heatmap value
-    best_k = cams.argmax(axis = 0) #Get the k index of the layer that has the greatest cam
+    voc_class_ids = class_indices.astype(np.int64) + 1  # Add 1 to class indices to account for background class
+    max_cam = cams.max(axis=0)
+    best_k = cams.argmax(axis=0)
 
     pseudo_mask = np.where(max_cam >= cam_threshhold, voc_class_ids[best_k], 0)
     return pseudo_mask.astype(np.int64)
@@ -240,6 +276,7 @@ def compute_cams(
     img_tensor: torch.Tensor,
     class_indices,
     method: str = "cam",
+    target_size: tuple[int, int] | None = None,
     scales: tuple[float, ...] = (1.0,),
     hflip: bool = False,
     layers: tuple[str, ...] = ("layer4",),
@@ -247,8 +284,9 @@ def compute_cams(
 ) -> np.ndarray:
     """Single entry point for CAM / LayerCAM on one image: returns a NumPy array (K, H, W) in [0, 1].
 
-    Handles the device transfer and class-index conversion that every caller used to repeat.
-    method: "cam" (classic CAM) or "layercam" (uses `layers` and `shallow_gamma`).
+    - `img_tensor`: (3, H_in, W_in) or (1, 3, H_in, W_in) at classifier input size (e.g. 448x448).
+    - `target_size`: optional `(H_orig, W_orig)` output size so CAMs are interpolated directly to the
+      native image resolution without intermediate aspect-ratio distortion.
     """
     device = next(model.parameters()).device
     if img_tensor.dim() == 3:
@@ -257,10 +295,12 @@ def compute_cams(
     class_idx = torch.as_tensor(class_indices, dtype=torch.long, device=device).view(-1)
 
     if method == "cam":
-        cams = gen_cam_resnet(model, img_tensor, class_idx, scales=scales, hflip=hflip)
+        cams = gen_cam_resnet(
+            model, img_tensor, class_idx, target_size=target_size, scales=scales, hflip=hflip
+        )
     elif method == "layercam":
         cams = gen_layercam_resnet(
-            model, img_tensor, class_idx,
+            model, img_tensor, class_idx, target_size=target_size,
             layers=layers, scales=scales, hflip=hflip, shallow_gamma=shallow_gamma,
         )
     else:
