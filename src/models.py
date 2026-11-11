@@ -38,17 +38,27 @@ def load_classifier(
     checkpoint_path,
     device="cpu",
     num_classes: int = 20,
-    layer4_stride1: bool = False,
+    layer4_stride1: bool | None = None,
 ) -> nn.Module:
     """Build a classifier, load a checkpoint into it and return it in eval mode on `device`.
 
     Accepts both a plain state_dict file and a training payload with a "model_state_dict" key.
+    When `layer4_stride1 is None`, automatically reads `config["layer4_stride1"]` from payload
+    checkpoints if available (defaulting to False for plain state_dict files).
     """
     import torch
 
-    model = build_classifier(model_name, num_classes=num_classes, layer4_stride1=layer4_stride1)
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "model_state_dict" in state:
+        if layer4_stride1 is None:
+            cfg = state.get("config")
+            if isinstance(cfg, dict) and "layer4_stride1" in cfg:
+                layer4_stride1 = bool(cfg["layer4_stride1"])
         state = state["model_state_dict"]
+
+    if layer4_stride1 is None:
+        layer4_stride1 = False
+
+    model = build_classifier(model_name, num_classes=num_classes, layer4_stride1=layer4_stride1)
     model.load_state_dict(state)
     return model.to(device).eval()
