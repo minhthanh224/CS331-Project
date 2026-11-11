@@ -225,7 +225,9 @@ def _select_negative_points(
     # 2. Confident background negative point (anti-overexpansion when CAM covers >=32% of a >=48x48 box)
     fg_ratio = float(fg_zone_box.mean())
     if len(neg_pts) < max_neg_points and bg_threshold > 0.0 and (bw * bh >= 48 * 48) and fg_ratio >= 0.32:
-        eff_bg_thr = min(bg_threshold, 0.5 * low_threshold)
+        # bg_threshold kỳ vọng đã nằm dưới low_threshold (notebook tune bg_ratio < 1);
+        # chỉ giữ guard nhẹ để background không vượt lên vùng foreground, tránh clamp cứng 0.5*low làm miền tune thoái hoá.
+        eff_bg_thr = min(bg_threshold, 0.9 * low_threshold)
         max_any_cam_box = cams[:, by0:by1, bx0:bx1].max(axis=0)
         safe_bg = (max_any_cam_box <= eff_bg_thr) & (dist_fg >= 10.0)
 
