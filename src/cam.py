@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from .constants import IMAGENET_MEAN, IMAGENET_STD
+from .models import default_layercam_layers, get_classifier_head
 
 def gen_cam_resnet(
     model: nn.Module,
@@ -16,7 +17,7 @@ def gen_cam_resnet(
     hflip: bool = False,
 ):
     """
-    Generate Class Activation Maps (CAM) for a ResNet model.
+    Generate Class Activation Maps (CAM) for a ResNet or ConvNeXt model.
     Supports optional Multi-scale + Horizontal Flip Test-Time Augmentation (TTA).
 
     Supports two broadcasting modes:
@@ -29,7 +30,8 @@ def gen_cam_resnet(
        - class_indices: (B,) one target class index per image
        - Returns: (B, H, W) CAM heatmaps, one for each image in the batch.
     """
-    # Remove the last two layers (avgpool and fc) to extract convolutional feature maps
+    # Remove the last two layers (avgpool + fc/classifier) to extract convolutional feature maps.
+    # Works for ResNet (children: ... layer4, avgpool, fc) and ConvNeXt (features, avgpool, classifier).
     feature_extractor = nn.Sequential(*list(model.children())[:-2]).eval()
 
     # If a single image (3, H, W) is passed, add a batch dimension -> (1, 3, H, W)
@@ -47,7 +49,7 @@ def gen_cam_resnet(
 
     with torch.no_grad():
         # Get classifier weights for the target classes: (K, C) or (B, C)
-        class_weights = model.fc.weight[class_indices]
+        class_weights = get_classifier_head(model).weight[class_indices]
         # Reshape weights to (K, C, 1, 1) or (B, C, 1, 1) for spatial broadcasting
         weights = class_weights[:, :, None, None]
 
@@ -83,6 +85,14 @@ def gen_cam_resnet(
     return cam
 
 
+def _resolve_module(model: nn.Module, name: str) -> nn.Module:
+    """Resolve `"layer4"` or a dotted name such as `"features.7"` to a submodule."""
+    module = model
+    for part in name.split("."):
+        module = getattr(module, part)
+    return module
+
+
 def _layercam_single_pass(
     model: nn.Module,
     image: torch.Tensor,
@@ -101,7 +111,7 @@ def _layercam_single_pass(
     activations = {}
     hooks = []
     for name in layers:
-        module = getattr(model, name)
+        module = _resolve_module(model, name)
         hooks.append(module.register_forward_hook(
             lambda _m, _inp, out, key=name: activations.__setitem__(key, out)
         ))
@@ -125,8 +135,9 @@ def _layercam_single_pass(
         cam_l = F.interpolate(cam_l, size=target_size, mode="bilinear", align_corners=False).squeeze(1)
         cam_l = cam_l / cam_l.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
 
-        # Shallow stages have weak responses: rescale with tanh(gamma * M / max(M))
-        if name != "layer4":
+        # Shallow stages have weak responses: rescale with tanh(gamma * M / max(M)).
+        # The deepest stage in `layers` is treated as the "deep" one (no tanh).
+        if name != layers[-1]:
             cam_l = torch.tanh(shallow_gamma * cam_l)
             cam_l = cam_l / cam_l.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
 
@@ -141,22 +152,28 @@ def gen_layercam_resnet(
     input_tensor: torch.Tensor,
     class_indices,
     target_size=None,
-    layers: tuple[str, ...] = ("layer4",),
+    layers: tuple[str, ...] | None = None,
     scales: tuple[float, ...] = (1.0,),
     hflip: bool = False,
     shallow_gamma: float = 2.0,
 ):
     """
-    Generate LayerCAM heatmaps (Jiang et al., TIP 2021) for a ResNet model.
+    Generate LayerCAM heatmaps (Jiang et al., TIP 2021) for a ResNet or ConvNeXt model.
     Same broadcasting modes and TTA options as gen_cam_resnet:
     1. Multi-class on a single image: input (3, H, W) or (1, 3, H, W), class_indices (K,) -> (K, H, W)
     2. Single-class per image on a batch: input (B, 3, H, W), class_indices (B,) -> (B, H, W)
 
-    layers: ResNet stages to use, e.g. ("layer4",) or ("layer3", "layer4") or ("layer2", "layer3", "layer4").
+    layers: stages to fuse. None -> deepest stage (ResNet "layer4", ConvNeXt "features.7").
+        ResNet examples: ("layer2", "layer3", "layer4").
+        ConvNeXt examples: ("features.5", "features.7") or
+        ("features.3", "features.5", "features.7") for higher-resolution fusion.
     shallow_gamma: tanh scaling factor applied to shallow stages before fusion.
     """
     model.eval()
     device = next(model.parameters()).device
+
+    if layers is None:
+        layers = default_layercam_layers(model)
 
     if input_tensor.dim() == 3:
         input_tensor = input_tensor.unsqueeze(0)
@@ -290,7 +307,7 @@ def compute_cams(
     target_size: tuple[int, int] | None = None,
     scales: tuple[float, ...] = (1.0,),
     hflip: bool = False,
-    layers: tuple[str, ...] = ("layer4",),
+    layers: tuple[str, ...] | None = None,
     shallow_gamma: float = 2.0,
 ) -> np.ndarray:
     """Single entry point for CAM / LayerCAM on one image: returns a NumPy array (K, H, W) in [0, 1].
