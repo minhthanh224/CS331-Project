@@ -15,4 +15,7 @@ IGNORE_INDEX = 255                      # VOC boundary / "difficult" pixels
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-SUPPORTED_BACKBONES = ("resnet18", "resnet50", "resnet101")
+RESNET_BACKBONES = ("resnet18", "resnet50", "resnet101")
+# torchvision ships ConvNeXt V1 only (V2 lives in `timm`). All four use ImageNet-1K weights.
+CONVNEXT_BACKBONES = ("convnext_tiny", "convnext_small", "convnext_base", "convnext_large")
+SUPPORTED_BACKBONES = RESNET_BACKBONES + CONVNEXT_BACKBONES
