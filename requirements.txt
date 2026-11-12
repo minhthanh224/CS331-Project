@@ -65,6 +65,7 @@ nest-asyncio2==1.7.4
 networkx==3.6.1
 notebook_shim==0.2.4
 numpy==2.5.2
+optuna==5.0.0
 packaging==26.3
 pandas==3.0.6
 pandocfilters==1.5.1
