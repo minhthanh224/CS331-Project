@@ -63,10 +63,13 @@ def make_cam_fn(
     method: str = "cam",
     scales: tuple[float, ...] = (1.0,),
     hflip: bool = False,
-    layers: tuple[str, ...] = ("layer4",),
+    layers: tuple[str, ...] | None = None,
     shallow_gamma: float = 2.0,
 ) -> CamFn:
-    """CAM / LayerCAM generator bound to a model and its TTA settings."""
+    """CAM / LayerCAM generator bound to a model and its TTA settings.
+
+    `layers=None` picks the deepest stage automatically (ResNet `layer4`, ConvNeXt `features.7`).
+    """
     def cam_fn(
         img_tensor: torch.Tensor,
         active_classes,
@@ -198,9 +201,9 @@ def build_optuna_pipeline(
     """
     scales = tuple(scales if scales is not None else best_params.get("cam_scales", (1.0,)))
     hflip = bool(hflip if hflip is not None else best_params.get("cam_hflip", False))
-    layercam_layers = tuple(
-        layercam_layers if layercam_layers is not None else best_params.get("layercam_layers", ("layer4",))
-    )
+    if layercam_layers is None:
+        layercam_layers = best_params.get("layercam_layers")
+    layercam_layers = tuple(layercam_layers) if layercam_layers is not None else None
     shallow_gamma = float(
         shallow_gamma if shallow_gamma is not None else best_params.get("layercam_shallow_gamma", 2.0)
     )
