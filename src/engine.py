@@ -15,17 +15,29 @@ def normalize_batch(images: torch.Tensor) -> torch.Tensor:
     return _NORMALIZE(images)
 
 
+def _head_prefixes(model: nn.Module) -> tuple[str, ...]:
+    """Parameter-name prefixes of the classification head (ResNet `fc`, ConvNeXt `classifier`)."""
+    if hasattr(model, "fc"):
+        return ("fc.",)
+    if hasattr(model, "classifier"):
+        return ("classifier.",)
+    return ()
+
+
 def build_optimizer(
     model: nn.Module,
     backbone_lr: float,
     head_lr: float | None = None,
     weight_decay: float = 0.0,
 ) -> torch.optim.Optimizer:
-    """AdamW with an optional separate (usually larger) learning rate for the new `fc` head."""
+    """AdamW with an optional separate (usually larger) learning rate for the new head."""
     if head_lr is None:
         return torch.optim.AdamW(model.parameters(), lr=backbone_lr, weight_decay=weight_decay)
-    backbone_params = [p for n, p in model.named_parameters() if not n.startswith("fc.")]
-    head_params = [p for n, p in model.named_parameters() if n.startswith("fc.")]
+    prefixes = _head_prefixes(model)
+    backbone_params = [p for n, p in model.named_parameters() if not n.startswith(prefixes)]
+    head_params = [p for n, p in model.named_parameters() if n.startswith(prefixes)]
+    if not head_params:
+        return torch.optim.AdamW(model.parameters(), lr=backbone_lr, weight_decay=weight_decay)
     return torch.optim.AdamW(
         [
             {"params": backbone_params, "lr": backbone_lr},
