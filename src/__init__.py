@@ -10,11 +10,13 @@ from .cam import (
 )
 from .config import TrainConfig
 from .constants import (
+    CONVNEXT_BACKBONES,
     IGNORE_INDEX,
     IMAGENET_MEAN,
     IMAGENET_STD,
     NUM_SEG_CLASSES,
     NUM_VOC_CLASSES,
+    RESNET_BACKBONES,
     SUPPORTED_BACKBONES,
     VOC_CLASSES,
 )
@@ -51,7 +53,15 @@ from .logger import (
     seg_summary_row,
 )
 from .metrics import SegmentationEvaluator, compute_classification_metrics
-from .models import MODEL_REGISTRY, build_classifier, load_classifier
+from .models import (
+    CONVNEXT_MODEL_NAMES,
+    MODEL_REGISTRY,
+    build_classifier,
+    default_layercam_layers,
+    get_classifier_head,
+    is_convnext,
+    load_classifier,
+)
 from .pipeline import (
     BackbonePipeline,
     build_optuna_pipeline,
@@ -96,6 +106,8 @@ __all__ = [
     "IGNORE_INDEX",
     "IMAGENET_MEAN",
     "IMAGENET_STD",
+    "RESNET_BACKBONES",
+    "CONVNEXT_BACKBONES",
     "SUPPORTED_BACKBONES",
     # config & utils
     "TrainConfig",
@@ -121,6 +133,10 @@ __all__ = [
     "load_eval_samples",
     # models & engine
     "MODEL_REGISTRY",
+    "CONVNEXT_MODEL_NAMES",
+    "is_convnext",
+    "get_classifier_head",
+    "default_layercam_layers",
     "build_classifier",
     "load_classifier",
     "normalize_batch",
