@@ -73,6 +73,19 @@ from .pipeline import (
     make_sam_mask_fn,
     predict_sample_masks,
 )
+from .s2c import (
+    S2CProjectionHead,
+    VOCS2CDataset,
+    build_s2c_optimizer,
+    build_sam_amg,
+    cache_sam_segments,
+    cpm_pseudo_mask_loss,
+    forward_resnet_features,
+    generate_cpm_pseudo_masks,
+    rasterize_sam_masks,
+    sam_segment_contrasting_loss,
+    train_s2c_one_epoch,
+)
 from .sam_utils import (
     SAM_MODEL_SPECS,
     build_sam_predictor,
@@ -159,6 +172,18 @@ __all__ = [
     "get_sam_embedding",
     "set_sam_embedding",
     "gen_sam_pseudo_mask",
+    # S2C (From SAM to CAMs)
+    "S2CProjectionHead",
+    "VOCS2CDataset",
+    "build_s2c_optimizer",
+    "build_sam_amg",
+    "cache_sam_segments",
+    "cpm_pseudo_mask_loss",
+    "forward_resnet_features",
+    "generate_cpm_pseudo_masks",
+    "rasterize_sam_masks",
+    "sam_segment_contrasting_loss",
+    "train_s2c_one_epoch",
     # pipeline, metrics, logger, visualize
     "BackbonePipeline",
     "make_cam_fn",
