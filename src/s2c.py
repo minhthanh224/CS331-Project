@@ -136,17 +136,24 @@ def _save_uint8_png(arr: np.ndarray, out_path: Path) -> None:
     Image.fromarray(arr, mode="L").save(out_path, compress_level=1)
 
 
-def _encode_sam_images_batch(
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    return isinstance(exc, torch.cuda.OutOfMemoryError) or (
+        isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    )
+
+
+def _encode_sam_images_chunked(
     sam_model,
     images_u8: list[np.ndarray],
     device: torch.device,
     amp_dtype: torch.dtype | None,
-) -> tuple[torch.Tensor, list[tuple[int, int]], list[tuple[int, int]]]:
-    """Batch-run SAM's heavy ViT image_encoder in AMP, returning FP32 embeddings `(B, 256, 64, 64)`."""
+    max_chunk_size: int | None = None,
+) -> tuple[torch.Tensor, list[tuple[int, int]], list[tuple[int, int]], int]:
+    """Batch-run SAM's heavy ViT image_encoder in AMP with automatic CUDA OOM batch-size backoff."""
     from segment_anything.utils.transforms import ResizeLongestSide
 
     resize_tf = ResizeLongestSide(sam_model.image_encoder.img_size)
-    prepped = []
+    resized_cpu: list[np.ndarray] = []
     orig_sizes: list[tuple[int, int]] = []
     input_sizes: list[tuple[int, int]] = []
 
@@ -155,17 +162,51 @@ def _encode_sam_images_batch(
         orig_sizes.append((H, W))
         resized = resize_tf.apply_image(img_u8)
         input_sizes.append(resized.shape[:2])
-        t = torch.as_tensor(resized, dtype=torch.float32, device=device).permute(2, 0, 1)
-        prepped.append(sam_model.preprocess(t))
+        resized_cpu.append(resized)
 
-    batch_t = torch.stack(prepped, dim=0)
-    with torch.inference_mode():
-        if amp_dtype is not None:
-            with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
-                features = sam_model.image_encoder(batch_t)
-        else:
-            features = sam_model.image_encoder(batch_t)
-    return features.float(), orig_sizes, input_sizes
+    def _run_subbatch(sub_resized: list[np.ndarray]) -> torch.Tensor:
+        sub_prepped = []
+        for r in sub_resized:
+            t = torch.as_tensor(r, dtype=torch.float32, device=device).permute(2, 0, 1)
+            sub_prepped.append(sam_model.preprocess(t))
+        batch_t = torch.stack(sub_prepped, dim=0)
+        with torch.inference_mode():
+            if amp_dtype is not None:
+                with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                    feats = sam_model.image_encoder(batch_t)
+            else:
+                feats = sam_model.image_encoder(batch_t)
+        return feats.float()
+
+    total = len(resized_cpu)
+    chunk_sz = total if max_chunk_size is None else max(1, min(total, int(max_chunk_size)))
+
+    while True:
+        feat_chunks: list[torch.Tensor] = []
+        try:
+            for s in range(0, total, chunk_sz):
+                feat_chunks.append(_run_subbatch(resized_cpu[s : s + chunk_sz]))
+            return torch.cat(feat_chunks, dim=0), orig_sizes, input_sizes, chunk_sz
+        except RuntimeError as exc:
+            feat_chunks.clear()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if not _is_cuda_oom_error(exc) or chunk_sz <= 1:
+                raise
+            chunk_sz = max(1, chunk_sz // 2)
+
+
+def _encode_sam_images_batch(
+    sam_model,
+    images_u8: list[np.ndarray],
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, list[tuple[int, int]], list[tuple[int, int]]]:
+    """Batch-run SAM's heavy ViT image_encoder in AMP, returning FP32 embeddings `(B, 256, 64, 64)`."""
+    features, orig_sizes, input_sizes, _ = _encode_sam_images_chunked(
+        sam_model, images_u8, device=device, amp_dtype=amp_dtype
+    )
+    return features, orig_sizes, input_sizes
 
 
 def _decode_amg_segment_map_gpu(
@@ -363,17 +404,26 @@ def cache_sam_segments(
             return img_id, np.array(source.convert("RGB"), dtype=np.uint8)
 
     generated = 0
+    active_batch_sz = max(1, encode_batch_size)
+    warned_oom = False
     pbar = tqdm(total=len(pending_ids), desc=desc)
     with ThreadPoolExecutor(max_workers=max(1, num_io_workers)) as io_pool:
         save_futures = []
-        for start in range(0, len(pending_ids), max(1, encode_batch_size)):
-            batch_ids = pending_ids[start : start + encode_batch_size]
+        pos_ptr = 0
+        while pos_ptr < len(pending_ids):
+            batch_ids = pending_ids[pos_ptr : pos_ptr + active_batch_sz]
+            pos_ptr += len(batch_ids)
             loaded = list(io_pool.map(_load_rgb, batch_ids))
             images_u8 = [item[1] for item in loaded]
 
-            features, orig_sizes, input_sizes = _encode_sam_images_batch(
-                sam_model, images_u8, device=device, amp_dtype=amp_dtype
+            features, orig_sizes, input_sizes, used_chunk = _encode_sam_images_chunked(
+                sam_model, images_u8, device=device, amp_dtype=amp_dtype, max_chunk_size=active_batch_sz
             )
+            if used_chunk < active_batch_sz:
+                if not warned_oom:
+                    pbar.write(f"[S2C] CUDA OOM backoff: reducing SAM encode_batch_size {active_batch_sz} -> {used_chunk}")
+                    warned_oom = True
+                active_batch_sz = used_chunk
             for b, (img_id, _) in enumerate(loaded):
                 seg_map = _decode_amg_segment_map_gpu(
                     sam_model=sam_model,
@@ -485,12 +535,15 @@ def generate_cpm_pseudo_masks(
         return idx, img_id, img_u8, img_tensor
 
     generated = 0
+    warned_oom = False
     pbar = tqdm(total=len(pending), desc=desc)
     with ThreadPoolExecutor(max_workers=max(1, num_io_workers)) as io_pool:
         save_futures = []
         batch_sz = max(1, encode_batch_size) if can_batch_sam else 1
-        for start in range(0, len(pending), batch_sz):
-            chunk = pending[start : start + batch_sz]
+        pos_ptr = 0
+        while pos_ptr < len(pending):
+            chunk = pending[pos_ptr : pos_ptr + batch_sz]
+            pos_ptr += len(chunk)
             loaded = list(io_pool.map(_load_item, chunk))
 
             if can_batch_sam:
@@ -502,9 +555,14 @@ def generate_cpm_pseudo_masks(
                 encoded_map = {}
                 if encode_positions:
                     imgs_to_encode = [loaded[pos][2] for pos in encode_positions]
-                    feats, orig_sizes, input_sizes = _encode_sam_images_batch(
-                        sam_model, imgs_to_encode, device=sam_device, amp_dtype=amp_dtype
+                    feats, orig_sizes, input_sizes, used_chunk = _encode_sam_images_chunked(
+                        sam_model, imgs_to_encode, device=sam_device, amp_dtype=amp_dtype, max_chunk_size=batch_sz
                     )
+                    if used_chunk < batch_sz:
+                        if not warned_oom:
+                            pbar.write(f"[S2C] CUDA OOM backoff: reducing CPM SAM encode_batch_size {batch_sz} -> {used_chunk}")
+                            warned_oom = True
+                        batch_sz = used_chunk
                     for k_pos, orig_pos in enumerate(encode_positions):
                         encoded_map[orig_pos] = (
                             feats[k_pos : k_pos + 1],
