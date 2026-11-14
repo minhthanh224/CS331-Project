@@ -10,6 +10,7 @@ classification (`BCEWithLogitsLoss`):
 from __future__ import annotations
 
 import random
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Sequence
 
@@ -21,6 +22,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.ops import batched_nms
 from torchvision.transforms import functional as TF
 from tqdm.auto import tqdm
 
@@ -121,35 +123,284 @@ def build_sam_amg(
     )
 
 
+def _auto_sam_amp_dtype(device: torch.device, use_amp: bool = True) -> torch.dtype | None:
+    """Pick BF16 on Ada/Ampere+ GPUs (e.g. L4), FP16 on older CUDA GPUs, or None on CPU."""
+    if not use_amp or device.type != "cuda":
+        return None
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _save_uint8_png(arr: np.ndarray, out_path: Path) -> None:
+    Image.fromarray(arr, mode="L").save(out_path, compress_level=1)
+
+
+def _encode_sam_images_batch(
+    sam_model,
+    images_u8: list[np.ndarray],
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, list[tuple[int, int]], list[tuple[int, int]]]:
+    """Batch-run SAM's heavy ViT image_encoder in AMP, returning FP32 embeddings `(B, 256, 64, 64)`."""
+    from segment_anything.utils.transforms import ResizeLongestSide
+
+    resize_tf = ResizeLongestSide(sam_model.image_encoder.img_size)
+    prepped = []
+    orig_sizes: list[tuple[int, int]] = []
+    input_sizes: list[tuple[int, int]] = []
+
+    for img_u8 in images_u8:
+        H, W = img_u8.shape[:2]
+        orig_sizes.append((H, W))
+        resized = resize_tf.apply_image(img_u8)
+        input_sizes.append(resized.shape[:2])
+        t = torch.as_tensor(resized, dtype=torch.float32, device=device).permute(2, 0, 1)
+        prepped.append(sam_model.preprocess(t))
+
+    batch_t = torch.stack(prepped, dim=0)
+    with torch.inference_mode():
+        if amp_dtype is not None:
+            with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                features = sam_model.image_encoder(batch_t)
+        else:
+            features = sam_model.image_encoder(batch_t)
+    return features.float(), orig_sizes, input_sizes
+
+
+def _decode_amg_segment_map_gpu(
+    sam_model,
+    image_embedding: torch.Tensor,
+    original_size: tuple[int, int],
+    input_size: tuple[int, int],
+    points_norm: np.ndarray,
+    points_per_batch: int = 256,
+    pred_iou_thresh: float = 0.86,
+    stability_score_thresh: float = 0.92,
+    box_nms_thresh: float = 0.7,
+    max_segments: int = 255,
+    amp_dtype: torch.dtype | None = None,
+) -> np.ndarray:
+    """Decode SAM grid prompts directly to a `(H, W)` uint8 segment map on GPU without RLE round-trips."""
+    from segment_anything.utils.amg import batched_mask_to_box, calculate_stability_score
+
+    device = image_embedding.device
+    H, W = original_size
+    H_in, W_in = input_size
+    max_hw = max(H, W)
+    H_256 = max(1, int(round(256.0 * H / max_hw)))
+    W_256 = max(1, int(round(256.0 * W / max_hw)))
+
+    pts_in = points_norm * np.array([W_in, H_in], dtype=np.float32)
+    pts_t = torch.as_tensor(pts_in, dtype=torch.float32, device=device).unsqueeze(1)
+    lbls_t = torch.ones((len(pts_t), 1), dtype=torch.int32, device=device)
+    dense_pe = sam_model.prompt_encoder.get_dense_pe()
+
+    mask_chunks = []
+    iou_chunks = []
+    with torch.inference_mode():
+        for start in range(0, len(pts_t), points_per_batch):
+            pts_c = pts_t[start : start + points_per_batch]
+            lbls_c = lbls_t[start : start + points_per_batch]
+            if amp_dtype is not None:
+                with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+                    sparse_emb, dense_emb = sam_model.prompt_encoder(
+                        points=(pts_c, lbls_c), boxes=None, masks=None
+                    )
+                    low_masks, iou_preds = sam_model.mask_decoder(
+                        image_embeddings=image_embedding,
+                        image_pe=dense_pe,
+                        sparse_prompt_embeddings=sparse_emb,
+                        dense_prompt_embeddings=dense_emb,
+                        multimask_output=True,
+                    )
+            else:
+                sparse_emb, dense_emb = sam_model.prompt_encoder(
+                    points=(pts_c, lbls_c), boxes=None, masks=None
+                )
+                low_masks, iou_preds = sam_model.mask_decoder(
+                    image_embeddings=image_embedding,
+                    image_pe=dense_pe,
+                    sparse_prompt_embeddings=sparse_emb,
+                    dense_prompt_embeddings=dense_emb,
+                    multimask_output=True,
+                )
+
+            flat_masks = low_masks.float().flatten(0, 1)
+            flat_ious = iou_preds.float().flatten(0, 1)
+            keep = flat_ious > pred_iou_thresh
+            if keep.any():
+                mask_chunks.append(flat_masks[keep])
+                iou_chunks.append(flat_ious[keep])
+
+    if not mask_chunks:
+        return np.zeros((H, W), dtype=np.uint8)
+
+    masks = torch.cat(mask_chunks, dim=0)
+    scores = torch.cat(iou_chunks, dim=0)
+
+    stability = calculate_stability_score(
+        masks, mask_threshold=sam_model.mask_threshold, threshold_offset=1.0
+    )
+    keep_stab = stability >= stability_score_thresh
+    if not keep_stab.any():
+        return np.zeros((H, W), dtype=np.uint8)
+
+    masks = masks[keep_stab]
+    scores = scores[keep_stab]
+
+    # Unpad & resize surviving masks to (H_256, W_256) on GPU
+    masks = sam_model.postprocess_masks(
+        masks.unsqueeze(1), input_size=input_size, original_size=(H_256, W_256)
+    ).squeeze(1)
+    bin_masks = masks > sam_model.mask_threshold
+    areas = bin_masks.flatten(1).sum(dim=1)
+    non_empty = areas > 0
+    if not non_empty.any():
+        return np.zeros((H, W), dtype=np.uint8)
+
+    bin_masks = bin_masks[non_empty]
+    scores = scores[non_empty]
+    boxes = batched_mask_to_box(bin_masks)
+
+    keep_nms = batched_nms(
+        boxes.float(),
+        scores.float(),
+        torch.zeros(len(boxes), dtype=torch.long, device=device),
+        iou_threshold=box_nms_thresh,
+    )
+    bin_masks = bin_masks[keep_nms]
+    scores = scores[keep_nms]
+    areas = bin_masks.flatten(1).sum(dim=1)
+
+    if len(bin_masks) > max_segments:
+        rank = scores * torch.log1p(areas.float())
+        top_idx = torch.topk(rank, k=max_segments).indices
+        bin_masks = bin_masks[top_idx]
+        areas = areas[top_idx]
+
+    # Paint largest-to-smallest so fine object parts keep distinct segment IDs
+    order = torch.argsort(areas, descending=True)
+    seg_256 = torch.zeros((H_256, W_256), dtype=torch.uint8, device=device)
+    for seg_id, idx_m in enumerate(order.tolist(), start=1):
+        seg_256[bin_masks[idx_m]] = seg_id
+
+    if (H_256, W_256) == (H, W):
+        return seg_256.cpu().numpy()
+    seg_full = (
+        F.interpolate(seg_256[None, None].float(), size=(H, W), mode="nearest")
+        .squeeze(0)
+        .squeeze(0)
+        .to(torch.uint8)
+    )
+    return seg_full.cpu().numpy()
+
+
 def cache_sam_segments(
     voc_root: Path,
     image_ids: Sequence[str],
-    amg,
-    output_dir: Path,
+    amg=None,
+    output_dir: Path = Path("sam_segments"),
+    sam_model=None,
+    encode_batch_size: int = 12,
+    points_per_side: int = 16,
+    points_per_batch: int = 256,
+    pred_iou_thresh: float = 0.86,
+    stability_score_thresh: float = 0.92,
+    box_nms_thresh: float = 0.7,
+    max_segments: int = 255,
+    use_amp: bool = True,
+    num_io_workers: int = 4,
     desc: str = "Caching SAM AMG segments",
 ) -> dict[str, int]:
-    """Pre-compute and save SAM segment maps as uint8 PNGs (`{img_id}.png`), skipping existing ones."""
+    """Pre-compute and save SAM segment maps as uint8 PNGs (`{img_id}.png`), skipping existing ones.
+
+    When `sam_model` is provided (or inferred from `amg.predictor.model`), uses batched AMP
+    image encoding + GPU-only mask decoding/NMS/rasterization + async PNG writes for 4-8x speedup.
+    """
     voc_root = Path(voc_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     image_dir = voc_root / "JPEGImages"
 
-    generated = 0
+    pending_ids: list[str] = []
     skipped = 0
-    for img_id in tqdm(image_ids, desc=desc):
-        out_path = output_dir / f"{img_id}.png"
-        if out_path.is_file():
+    for img_id in image_ids:
+        if (output_dir / f"{img_id}.png").is_file():
             skipped += 1
-            continue
+        else:
+            pending_ids.append(img_id)
 
+    if not pending_ids:
+        return {"generated": 0, "skipped": skipped, "total": len(image_ids)}
+
+    if sam_model is None and amg is not None and hasattr(amg, "predictor") and hasattr(amg.predictor, "model"):
+        sam_model = amg.predictor.model
+
+    if sam_model is None:
+        if amg is None:
+            raise ValueError("Provide either `sam_model` or `amg` to cache_sam_segments")
+        generated = 0
+        for img_id in tqdm(pending_ids, desc=desc):
+            with Image.open(image_dir / f"{img_id}.jpg") as source:
+                img_u8 = np.array(source.convert("RGB"), dtype=np.uint8)
+            H, W = img_u8.shape[:2]
+            with torch.inference_mode():
+                anns = amg.generate(img_u8)
+            seg_map = rasterize_sam_masks(anns, H, W, max_segments=max_segments)
+            _save_uint8_png(seg_map, output_dir / f"{img_id}.png")
+            generated += 1
+        return {"generated": generated, "skipped": skipped, "total": len(image_ids)}
+
+    from segment_anything.utils.amg import build_all_layer_point_grids
+
+    device = next(sam_model.parameters()).device
+    amp_dtype = _auto_sam_amp_dtype(device, use_amp=use_amp)
+    points_norm = build_all_layer_point_grids(points_per_side, 0, 1)[0]
+
+    def _load_rgb(img_id: str) -> tuple[str, np.ndarray]:
         with Image.open(image_dir / f"{img_id}.jpg") as source:
-            img_u8 = np.array(source.convert("RGB"), dtype=np.uint8)
-        H, W = img_u8.shape[:2]
-        with torch.inference_mode():
-            anns = amg.generate(img_u8)
-        seg_map = rasterize_sam_masks(anns, H, W)
-        Image.fromarray(seg_map, mode="L").save(out_path, optimize=True)
-        generated += 1
+            return img_id, np.array(source.convert("RGB"), dtype=np.uint8)
+
+    generated = 0
+    pbar = tqdm(total=len(pending_ids), desc=desc)
+    with ThreadPoolExecutor(max_workers=max(1, num_io_workers)) as io_pool:
+        save_futures = []
+        for start in range(0, len(pending_ids), max(1, encode_batch_size)):
+            batch_ids = pending_ids[start : start + encode_batch_size]
+            loaded = list(io_pool.map(_load_rgb, batch_ids))
+            images_u8 = [item[1] for item in loaded]
+
+            features, orig_sizes, input_sizes = _encode_sam_images_batch(
+                sam_model, images_u8, device=device, amp_dtype=amp_dtype
+            )
+            for b, (img_id, _) in enumerate(loaded):
+                seg_map = _decode_amg_segment_map_gpu(
+                    sam_model=sam_model,
+                    image_embedding=features[b : b + 1],
+                    original_size=orig_sizes[b],
+                    input_size=input_sizes[b],
+                    points_norm=points_norm,
+                    points_per_batch=points_per_batch,
+                    pred_iou_thresh=pred_iou_thresh,
+                    stability_score_thresh=stability_score_thresh,
+                    box_nms_thresh=box_nms_thresh,
+                    max_segments=max_segments,
+                    amp_dtype=amp_dtype,
+                )
+                save_futures.append(io_pool.submit(_save_uint8_png, seg_map, output_dir / f"{img_id}.png"))
+                generated += 1
+                pbar.update(1)
+
+            # Drain completed save tasks per batch to keep pending CPU memory bounded
+            if len(save_futures) >= max(4, encode_batch_size * 2):
+                for fut in save_futures:
+                    fut.result()
+                save_futures.clear()
+
+        for fut in save_futures:
+            fut.result()
+    pbar.close()
 
     return {"generated": generated, "skipped": skipped, "total": len(image_ids)}
 
@@ -170,14 +421,16 @@ def generate_cpm_pseudo_masks(
     sam_params: dict | None = None,
     ambiguous_cam_thr: float = 0.50,
     overwrite: bool = True,
+    encode_batch_size: int = 12,
+    use_amp: bool = True,
+    num_io_workers: int = 4,
     desc: str = "Generating CPM pseudo-masks",
 ) -> dict[str, int]:
     """Generate SAM-refined pseudo-masks prompted by CAM or LayerCAM using image-level GT labels.
 
-    Pixels where SAM predicts background (`0`) despite high CAM confidence (`>= ambiguous_cam_thr`)
-    are marked `IGNORE_INDEX (255)` so CPM supervision does not penalize unsegmented object parts.
-    Pixels where SAM predicts foreground (`> 0`) are kept even when raw CAM is low, allowing SAM's
-    full-object boundary to supervise under-activated regions.
+    Batches SAM's `image_encoder` in AMP when `predictor.model` is available, while keeping CAM
+    extraction and mask selection exact. Pixels where SAM predicts background (`0`) despite high
+    CAM confidence (`>= ambiguous_cam_thr`) are marked `IGNORE_INDEX (255)`.
     """
     voc_root = Path(voc_root)
     output_dir = Path(output_dir)
@@ -204,56 +457,123 @@ def generate_cpm_pseudo_masks(
     image_ids = labels_df["image_id"].tolist()
     label_matrix = labels_df[list(classes)].to_numpy(dtype=np.float32)
 
-    generated = 0
+    pending: list[tuple[int, str]] = []
     skipped = 0
-    for idx, img_id in enumerate(tqdm(image_ids, desc=desc)):
-        out_path = output_dir / f"{img_id}.png"
-        if not overwrite and out_path.is_file():
+    for idx, img_id in enumerate(image_ids):
+        if not overwrite and (output_dir / f"{img_id}.png").is_file():
             skipped += 1
-            continue
+        else:
+            pending.append((idx, img_id))
 
+    if not pending:
+        if was_training:
+            model.train()
+        return {"generated": 0, "skipped": skipped, "total": len(image_ids)}
+
+    sam_model = getattr(predictor, "model", None)
+    can_batch_sam = sam_model is not None and hasattr(sam_model, "image_encoder")
+    if can_batch_sam:
+        sam_device = next(sam_model.parameters()).device
+        amp_dtype = _auto_sam_amp_dtype(sam_device, use_amp=use_amp)
+
+    def _load_item(item: tuple[int, str]):
+        idx, img_id = item
         with Image.open(image_dir / f"{img_id}.jpg") as source:
             rgb_pil = source.convert("RGB")
             img_u8 = np.array(rgb_pil, dtype=np.uint8)
             img_tensor = eval_resize(rgb_pil)
+        return idx, img_id, img_u8, img_tensor
 
-        H, W = img_u8.shape[:2]
-        gt_classes = np.where(label_matrix[idx] > 0.5)[0].astype(np.int64)
-        if len(gt_classes) == 0:
-            Image.fromarray(np.zeros((H, W), dtype=np.uint8), mode="L").save(out_path)
-            generated += 1
-            continue
+    generated = 0
+    pbar = tqdm(total=len(pending), desc=desc)
+    with ThreadPoolExecutor(max_workers=max(1, num_io_workers)) as io_pool:
+        save_futures = []
+        batch_sz = max(1, encode_batch_size) if can_batch_sam else 1
+        for start in range(0, len(pending), batch_sz):
+            chunk = pending[start : start + batch_sz]
+            loaded = list(io_pool.map(_load_item, chunk))
 
-        cams = compute_cams(
-            model,
-            img_tensor,
-            gt_classes,
-            method=cam_method,
-            target_size=(H, W),
-            scales=cam_scales,
-            hflip=cam_hflip,
-            layers=layercam_layers,
-            shallow_gamma=shallow_gamma,
-        )
-        img_rgb = img_u8.astype(np.float32) / 255.0
-        with torch.inference_mode():
-            pseudo_mask = gen_sam_pseudo_mask(
-                predictor=predictor,
-                image_rgb=img_rgb,
-                cams=cams,
-                class_indices=gt_classes,
-                encode_image=True,
-                **sam_cfg,
-            )
+            if can_batch_sam:
+                # Only encode images that actually have >= 1 active GT class
+                encode_positions = [
+                    pos for pos, (idx, _, _, _) in enumerate(loaded)
+                    if (label_matrix[idx] > 0.5).any()
+                ]
+                encoded_map = {}
+                if encode_positions:
+                    imgs_to_encode = [loaded[pos][2] for pos in encode_positions]
+                    feats, orig_sizes, input_sizes = _encode_sam_images_batch(
+                        sam_model, imgs_to_encode, device=sam_device, amp_dtype=amp_dtype
+                    )
+                    for k_pos, orig_pos in enumerate(encode_positions):
+                        encoded_map[orig_pos] = (
+                            feats[k_pos : k_pos + 1],
+                            orig_sizes[k_pos],
+                            input_sizes[k_pos],
+                        )
 
-        pseudo_u8 = pseudo_mask.astype(np.uint8)
-        if ambiguous_cam_thr < 1.0:
-            max_cam = cams.max(axis=0)
-            ambiguous = (pseudo_u8 == 0) & (max_cam >= ambiguous_cam_thr)
-            pseudo_u8[ambiguous] = IGNORE_INDEX
+            for pos, (idx, img_id, img_u8, img_tensor) in enumerate(loaded):
+                H, W = img_u8.shape[:2]
+                gt_classes = np.where(label_matrix[idx] > 0.5)[0].astype(np.int64)
+                if len(gt_classes) == 0:
+                    save_futures.append(
+                        io_pool.submit(_save_uint8_png, np.zeros((H, W), dtype=np.uint8), output_dir / f"{img_id}.png")
+                    )
+                    generated += 1
+                    pbar.update(1)
+                    continue
 
-        Image.fromarray(pseudo_u8, mode="L").save(out_path)
-        generated += 1
+                cams = compute_cams(
+                    model,
+                    img_tensor,
+                    gt_classes,
+                    method=cam_method,
+                    target_size=(H, W),
+                    scales=cam_scales,
+                    hflip=cam_hflip,
+                    layers=layercam_layers,
+                    shallow_gamma=shallow_gamma,
+                )
+                img_rgb = img_u8.astype(np.float32) / 255.0
+
+                if can_batch_sam:
+                    feat_b, orig_sz, input_sz = encoded_map[pos]
+                    predictor.features = feat_b
+                    predictor.original_size = orig_sz
+                    predictor.input_size = input_sz
+                    predictor.is_image_set = True
+                    encode_flag = False
+                else:
+                    encode_flag = True
+
+                with torch.inference_mode():
+                    pseudo_mask = gen_sam_pseudo_mask(
+                        predictor=predictor,
+                        image_rgb=img_rgb,
+                        cams=cams,
+                        class_indices=gt_classes,
+                        encode_image=encode_flag,
+                        **sam_cfg,
+                    )
+
+                pseudo_u8 = pseudo_mask.astype(np.uint8)
+                if ambiguous_cam_thr < 1.0:
+                    max_cam = cams.max(axis=0)
+                    ambiguous = (pseudo_u8 == 0) & (max_cam >= ambiguous_cam_thr)
+                    pseudo_u8[ambiguous] = IGNORE_INDEX
+
+                save_futures.append(io_pool.submit(_save_uint8_png, pseudo_u8, output_dir / f"{img_id}.png"))
+                generated += 1
+                pbar.update(1)
+
+            if len(save_futures) >= max(4, batch_sz * 2):
+                for fut in save_futures:
+                    fut.result()
+                save_futures.clear()
+
+        for fut in save_futures:
+            fut.result()
+    pbar.close()
 
     if was_training:
         model.train()
