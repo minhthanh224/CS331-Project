@@ -10,12 +10,31 @@ import numpy as np
 #   kind "overlay" -> data is a CAM drawn over cell["image"] with transparency cell.get("alpha", 0.5)
 
 
+def _build_segmentation_palette(num_colors: int = 256) -> np.ndarray:
+    """Deterministic high-contrast RGB palette (0 = black background, 255 = neutral gray ignore)."""
+    palette = np.zeros((max(num_colors, 256), 3), dtype=np.uint8)
+    for idx in range(1, 255):
+        r = g = b = 0
+        c = idx
+        for bit in range(8):
+            r |= ((c >> 0) & 1) << (7 - bit)
+            g |= ((c >> 1) & 1) << (7 - bit)
+            b |= ((c >> 2) & 1) << (7 - bit)
+            c >>= 3
+        palette[idx] = (r, g, b)
+    palette[255] = (128, 128, 128)
+    return palette
+
+
+_SEG_PALETTE = _build_segmentation_palette()
+
+
 def image_cell(image: np.ndarray, title: str = "") -> dict:
     return {"kind": "image", "data": image, "title": title}
 
 
-def mask_cell(mask: np.ndarray, title: str = "") -> dict:
-    return {"kind": "mask", "data": mask, "title": title}
+def mask_cell(mask: np.ndarray, title: str = "", num_classes: int | None = None) -> dict:
+    return {"kind": "mask", "data": mask, "title": title, "num_classes": num_classes}
 
 
 def heatmap_cell(cam: np.ndarray, title: str = "") -> dict:
@@ -31,7 +50,14 @@ def draw_cell(ax, cell: dict) -> None:
     if kind == "image":
         ax.imshow(cell["data"])
     elif kind == "mask":
-        ax.imshow(cell["data"], cmap="tab20", vmin=0, vmax=20)
+        mask = np.asarray(cell["data"])
+        num_classes = cell.get("num_classes")
+        valid = mask[mask != 255]
+        max_val = int(valid.max()) if valid.size > 0 else 0
+        if (num_classes is not None and num_classes > 21) or max_val > 20:
+            ax.imshow(_SEG_PALETTE[np.clip(mask, 0, 255)])
+        else:
+            ax.imshow(mask, cmap="tab20", vmin=0, vmax=20)
     elif kind == "heatmap":
         ax.imshow(cell["data"], cmap="jet", vmin=0, vmax=1)
     elif kind == "overlay":
