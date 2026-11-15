@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 
 from .cam import compute_cams, ensure_cam_size, gen_cam_pseudo_mask, select_active_classes
 from .constants import IGNORE_INDEX, NUM_SEG_CLASSES
-from .dataset import VOCClassificationDataset, load_eval_sample
+from .dataset import load_eval_sample
 from .dense_CRF import get_dense_crf_mask
 from .metrics import SegmentationEvaluator
 from .sam_utils import gen_sam_pseudo_mask
@@ -247,24 +247,29 @@ def build_optuna_pipeline(
 
 
 def evaluate_segmentation(
-    dataset: VOCClassificationDataset,
+    dataset,
     pipelines: dict[str, BackbonePipeline],
     image_size: int | tuple[int, int] | None = None,
     prepare_fn: Callable[[np.ndarray], None] | None = None,
     indices=None,
-    num_classes: int = NUM_SEG_CLASSES,
+    num_classes: int | None = None,
     ignore_index: int = IGNORE_INDEX,
     desc: str = "Segmentation evaluation",
 ) -> dict[str, dict[str, dict]]:
     """Evaluate every method of every backbone on the dataset in a single pass over the images.
 
-    - `image_size=None` (default): standard Pascal VOC benchmark protocol — evaluates masks against
+    - `image_size=None` (default): standard benchmark protocol — evaluates masks against
       native-resolution Ground Truth `(H_orig, W_orig)` while feeding `dataset[idx]` (e.g. 448x448)
       into the CNN for CAM extraction.
+    - `num_classes=None` (default): automatically infers `len(dataset.classes) + 1` (e.g. 21 for VOC,
+      81 for COCO), falling back to `NUM_SEG_CLASSES` (21).
     - `prepare_fn(img_u8)` is called once per image before any mask function, so work shared by all
       backbones (such as SAM image encoding) is done only once at native resolution.
     Returns {backbone: {method_label: metrics_dict}} with metrics from SegmentationEvaluator.compute().
     """
+    if num_classes is None:
+        num_classes = len(dataset.classes) + 1 if hasattr(dataset, "classes") else NUM_SEG_CLASSES
+
     evaluators = {
         name: {label: SegmentationEvaluator(num_classes=num_classes, ignore_index=ignore_index) for label in p.methods}
         for name, p in pipelines.items()
