@@ -70,6 +70,32 @@ def ensure_sam_checkpoint(model_type: str, target_dir, cache_dirs=()) -> Path:
     return local_path
 
 
+def patch_fast_sam_layernorm2d(sam_model):
+    """Replace unfused eager LayerNorm2d.forward in SAM/MobileSAM with fused C++/CUDA F.layer_norm."""
+    import types
+    import torch.nn.functional as F
+
+    if getattr(sam_model, "_fast_ln2d_patched", False):
+        return sam_model
+
+    def _fast_ln2d_forward(self, x):
+        w = self.weight if self.weight.dtype == x.dtype else self.weight.to(x.dtype)
+        b = self.bias if self.bias.dtype == x.dtype else self.bias.to(x.dtype)
+        return F.layer_norm(
+            x.permute(0, 2, 3, 1),
+            (x.shape[1],),
+            w,
+            b,
+            getattr(self, "eps", 1e-6),
+        ).permute(0, 3, 1, 2)
+
+    for mod in sam_model.modules():
+        if type(mod).__name__ == "LayerNorm2d" and hasattr(mod, "weight") and hasattr(mod, "bias"):
+            mod.forward = types.MethodType(_fast_ln2d_forward, mod)
+    sam_model._fast_ln2d_patched = True
+    return sam_model
+
+
 def load_sam_model(model_type: str, checkpoint_path, device):
     """Load a SAM or MobileSAM (`vit_t`) model from `checkpoint_path` onto `device` in eval mode."""
     if model_type not in SAM_MODEL_SPECS:
@@ -96,6 +122,7 @@ def load_sam_model(model_type: str, checkpoint_path, device):
         from segment_anything import sam_model_registry
 
     sam = sam_model_registry[model_type](checkpoint=str(checkpoint_path))
+    patch_fast_sam_layernorm2d(sam)
     sam.to(device=device).eval()
     return sam
 

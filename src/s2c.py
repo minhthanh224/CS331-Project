@@ -30,7 +30,7 @@ from .cam import compute_cams
 from .constants import IGNORE_INDEX, VOC_CLASSES
 from .engine import normalize_batch
 from .models import default_layercam_layers, get_classifier_head
-from .sam_utils import gen_sam_pseudo_mask
+from .sam_utils import gen_sam_pseudo_mask, patch_fast_sam_layernorm2d
 
 
 class S2CProjectionHead(nn.Module):
@@ -152,30 +152,31 @@ def _encode_sam_images_chunked(
     amp_dtype: torch.dtype | None,
     max_chunk_size: int | None = None,
 ) -> tuple[torch.Tensor, list[tuple[int, int]], list[tuple[int, int]], int]:
-    """Batch-run SAM's heavy ViT image_encoder in AMP with automatic CUDA OOM batch-size backoff."""
-    try:
-        from segment_anything.utils.transforms import ResizeLongestSide
-    except ImportError:
-        from mobile_sam.utils.transforms import ResizeLongestSide
+    """Batch-run SAM's ViT/TinyViT image_encoder in AMP with GPU resize and CUDA OOM backoff."""
+    patch_fast_sam_layernorm2d(sam_model)
 
     enc_img_size = int(getattr(sam_model.image_encoder, "img_size", 1024))
-    resize_tf = ResizeLongestSide(enc_img_size)
-    resized_cpu: list[np.ndarray] = []
     orig_sizes: list[tuple[int, int]] = []
     input_sizes: list[tuple[int, int]] = []
 
     for img_u8 in images_u8:
         H, W = img_u8.shape[:2]
+        scale = enc_img_size / max(H, W)
+        H_in = int(H * scale + 0.5)
+        W_in = int(W * scale + 0.5)
         orig_sizes.append((H, W))
-        resized = resize_tf.apply_image(img_u8)
-        input_sizes.append(resized.shape[:2])
-        resized_cpu.append(resized)
+        input_sizes.append((H_in, W_in))
 
-    def _run_subbatch(sub_resized: list[np.ndarray]) -> torch.Tensor:
+    def _run_subbatch(
+        sub_imgs: list[np.ndarray],
+        sub_in_sizes: list[tuple[int, int]],
+    ) -> torch.Tensor:
         sub_prepped = []
-        for r in sub_resized:
-            t = torch.as_tensor(r, dtype=torch.float32, device=device).permute(2, 0, 1)
-            sub_prepped.append(sam_model.preprocess(t))
+        for img_u8, (H_in, W_in) in zip(sub_imgs, sub_in_sizes):
+            t = torch.as_tensor(img_u8, device=device).permute(2, 0, 1).unsqueeze(0).float()
+            if t.shape[-2:] != (H_in, W_in):
+                t = F.interpolate(t, size=(H_in, W_in), mode="bilinear", align_corners=False)
+            sub_prepped.append(sam_model.preprocess(t.squeeze(0)))
         batch_t = torch.stack(sub_prepped, dim=0)
         with torch.inference_mode():
             if amp_dtype is not None:
@@ -185,14 +186,14 @@ def _encode_sam_images_chunked(
                 feats = sam_model.image_encoder(batch_t)
         return feats.float()
 
-    total = len(resized_cpu)
+    total = len(images_u8)
     chunk_sz = total if max_chunk_size is None else max(1, min(total, int(max_chunk_size)))
 
     while True:
         feat_chunks: list[torch.Tensor] = []
         try:
             for s in range(0, total, chunk_sz):
-                feat_chunks.append(_run_subbatch(resized_cpu[s : s + chunk_sz]))
+                feat_chunks.append(_run_subbatch(images_u8[s : s + chunk_sz], input_sizes[s : s + chunk_sz]))
             return torch.cat(feat_chunks, dim=0), orig_sizes, input_sizes, chunk_sz
         except RuntimeError as exc:
             feat_chunks.clear()
@@ -216,25 +217,102 @@ def _encode_sam_images_batch(
     return features, orig_sizes, input_sizes
 
 
+def _decode_sam_points_fast(
+    mask_decoder,
+    image_embedding: torch.Tensor,
+    dense_pe: torch.Tensor,
+    sparse_emb: torch.Tensor,
+    dense_emb: torch.Tensor,
+    pred_iou_thresh: float,
+    H_256: int,
+    W_256: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode grid point prompts with early IoU filtering before heavy `output_upscaling`."""
+    required_attrs = (
+        "transformer",
+        "iou_token",
+        "mask_tokens",
+        "iou_prediction_head",
+        "output_upscaling",
+        "output_hypernetworks_mlps",
+        "num_mask_tokens",
+    )
+    if not all(hasattr(mask_decoder, attr) for attr in required_attrs):
+        low_masks, iou_preds = mask_decoder(
+            image_embeddings=image_embedding,
+            image_pe=dense_pe,
+            sparse_prompt_embeddings=sparse_emb,
+            dense_prompt_embeddings=dense_emb,
+            multimask_output=True,
+        )
+        flat_masks = low_masks[..., :H_256, :W_256].float().flatten(0, 1)
+        flat_ious = iou_preds.float().flatten(0, 1)
+        keep = flat_ious > pred_iou_thresh
+        return flat_masks[keep], flat_ious[keep]
+
+    n_pts = sparse_emb.shape[0]
+    output_tokens = (
+        torch.cat([mask_decoder.iou_token.weight, mask_decoder.mask_tokens.weight], dim=0)
+        .unsqueeze(0)
+        .expand(n_pts, -1, -1)
+    )
+    tokens = torch.cat((output_tokens, sparse_emb), dim=1)
+    src = image_embedding.expand(n_pts, -1, -1, -1) + dense_emb
+    pos_src = dense_pe.expand(n_pts, -1, -1, -1)
+    _, c, h, w = src.shape
+
+    hs, src_out = mask_decoder.transformer(src, pos_src, tokens)
+    iou_preds = mask_decoder.iou_prediction_head(hs[:, 0, :])[:, 1:]
+    keep_pt = iou_preds.amax(dim=1) > pred_iou_thresh
+    if not keep_pt.any():
+        return (
+            iou_preds.new_empty((0, H_256, W_256), dtype=torch.float32),
+            iou_preds.new_empty((0,), dtype=torch.float32),
+        )
+
+    iou_kept = iou_preds[keep_pt]
+    mask_tokens_kept = hs[keep_pt, 2 : (1 + mask_decoder.num_mask_tokens), :]
+    src_kept = src_out[keep_pt].transpose(1, 2).view(-1, c, h, w)
+
+    upscaled = mask_decoder.output_upscaling(src_kept)
+    hyper_in = torch.stack(
+        [
+            mask_decoder.output_hypernetworks_mlps[i](mask_tokens_kept[:, i - 1, :])
+            for i in range(1, mask_decoder.num_mask_tokens)
+        ],
+        dim=1,
+    )
+    b_k, c_up, h_up, w_up = upscaled.shape
+    low_masks = (hyper_in @ upscaled.view(b_k, c_up, h_up * w_up)).view(
+        b_k, -1, h_up, w_up
+    )[..., :H_256, :W_256]
+
+    flat_masks = low_masks.float().flatten(0, 1)
+    flat_ious = iou_kept.float().flatten(0, 1)
+    keep = flat_ious > pred_iou_thresh
+    return flat_masks[keep], flat_ious[keep]
+
+
 def _decode_amg_segment_map_gpu(
     sam_model,
     image_embedding: torch.Tensor,
     original_size: tuple[int, int],
     input_size: tuple[int, int],
     points_norm: np.ndarray,
-    points_per_batch: int = 256,
+    points_per_batch: int = 128,
     pred_iou_thresh: float = 0.86,
     stability_score_thresh: float = 0.92,
     box_nms_thresh: float = 0.7,
     max_segments: int = 255,
     amp_dtype: torch.dtype | None = None,
 ) -> np.ndarray:
-    """Decode SAM grid prompts directly to a `(H, W)` uint8 segment map on GPU without RLE round-trips."""
+    """Decode SAM grid prompts directly to a `(H, W)` uint8 segment map on GPU without RLE or 1024px round-trips."""
     try:
         from segment_anything.utils.amg import batched_mask_to_box, calculate_stability_score
     except ImportError:
         from mobile_sam.utils.amg import batched_mask_to_box, calculate_stability_score
 
+    patch_fast_sam_layernorm2d(sam_model)
     device = image_embedding.device
     H, W = original_size
     H_in, W_in = input_size
@@ -258,31 +336,34 @@ def _decode_amg_segment_map_gpu(
                     sparse_emb, dense_emb = sam_model.prompt_encoder(
                         points=(pts_c, lbls_c), boxes=None, masks=None
                     )
-                    low_masks, iou_preds = sam_model.mask_decoder(
-                        image_embeddings=image_embedding,
-                        image_pe=dense_pe,
-                        sparse_prompt_embeddings=sparse_emb,
-                        dense_prompt_embeddings=dense_emb,
-                        multimask_output=True,
+                    masks_k, ious_k = _decode_sam_points_fast(
+                        sam_model.mask_decoder,
+                        image_embedding=image_embedding,
+                        dense_pe=dense_pe,
+                        sparse_emb=sparse_emb,
+                        dense_emb=dense_emb,
+                        pred_iou_thresh=pred_iou_thresh,
+                        H_256=H_256,
+                        W_256=W_256,
                     )
             else:
                 sparse_emb, dense_emb = sam_model.prompt_encoder(
                     points=(pts_c, lbls_c), boxes=None, masks=None
                 )
-                low_masks, iou_preds = sam_model.mask_decoder(
-                    image_embeddings=image_embedding,
-                    image_pe=dense_pe,
-                    sparse_prompt_embeddings=sparse_emb,
-                    dense_prompt_embeddings=dense_emb,
-                    multimask_output=True,
+                masks_k, ious_k = _decode_sam_points_fast(
+                    sam_model.mask_decoder,
+                    image_embedding=image_embedding,
+                    dense_pe=dense_pe,
+                    sparse_emb=sparse_emb,
+                    dense_emb=dense_emb,
+                    pred_iou_thresh=pred_iou_thresh,
+                    H_256=H_256,
+                    W_256=W_256,
                 )
 
-            flat_masks = low_masks.float().flatten(0, 1)
-            flat_ious = iou_preds.float().flatten(0, 1)
-            keep = flat_ious > pred_iou_thresh
-            if keep.any():
-                mask_chunks.append(flat_masks[keep])
-                iou_chunks.append(flat_ious[keep])
+            if masks_k.shape[0] > 0:
+                mask_chunks.append(masks_k)
+                iou_chunks.append(ious_k)
 
     if not mask_chunks:
         return np.zeros((H, W), dtype=np.uint8)
@@ -300,10 +381,6 @@ def _decode_amg_segment_map_gpu(
     masks = masks[keep_stab]
     scores = scores[keep_stab]
 
-    # Unpad & resize surviving masks to (H_256, W_256) on GPU
-    masks = sam_model.postprocess_masks(
-        masks.unsqueeze(1), input_size=input_size, original_size=(H_256, W_256)
-    ).squeeze(1)
     bin_masks = masks > sam_model.mask_threshold
     areas = bin_masks.flatten(1).sum(dim=1)
     non_empty = areas > 0
@@ -330,11 +407,10 @@ def _decode_amg_segment_map_gpu(
         bin_masks = bin_masks[top_idx]
         areas = areas[top_idx]
 
-    # Paint largest-to-smallest so fine object parts keep distinct segment IDs
+    # Paint largest-to-smallest in one vectorized kernel so fine object parts keep distinct IDs
     order = torch.argsort(areas, descending=True)
-    seg_256 = torch.zeros((H_256, W_256), dtype=torch.uint8, device=device)
-    for seg_id, idx_m in enumerate(order.tolist(), start=1):
-        seg_256[bin_masks[idx_m]] = seg_id
+    seg_ids = torch.arange(1, len(order) + 1, dtype=torch.uint8, device=device)[:, None, None]
+    seg_256 = (bin_masks[order].to(torch.uint8) * seg_ids).amax(dim=0)
 
     if (H_256, W_256) == (H, W):
         return seg_256.cpu().numpy()
@@ -355,7 +431,7 @@ def cache_sam_segments(
     sam_model=None,
     encode_batch_size: int = 12,
     points_per_side: int = 16,
-    points_per_batch: int = 256,
+    points_per_batch: int = 128,
     pred_iou_thresh: float = 0.86,
     stability_score_thresh: float = 0.92,
     box_nms_thresh: float = 0.7,
