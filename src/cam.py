@@ -100,10 +100,26 @@ def _layercam_single_pass(
     layers: tuple[str, ...],
     target_size,
     shallow_gamma: float,
+    max_targets_per_chunk: int = 4,
 ) -> torch.Tensor:
     """Run one forward/backward pass and return the fused LayerCAM: (N, H, W) in [0, 1]."""
-    # Multi-class on a single image: replicate the image so each copy back-propagates one class
+    # Multi-class on a single image: chunk targets to avoid VRAM spikes on crowded scenes (e.g. COCO).
     num_targets = class_indices.numel()
+    if image.shape[0] == 1 and num_targets > max_targets_per_chunk:
+        chunks = [
+            _layercam_single_pass(
+                model,
+                image,
+                class_indices[start : start + max_targets_per_chunk],
+                layers,
+                target_size,
+                shallow_gamma,
+                max_targets_per_chunk=max_targets_per_chunk,
+            )
+            for start in range(0, num_targets, max_targets_per_chunk)
+        ]
+        return torch.cat(chunks, dim=0)
+
     if image.shape[0] == 1 and num_targets > 1:
         image = image.expand(num_targets, -1, -1, -1)
 
