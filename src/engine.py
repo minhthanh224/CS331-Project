@@ -63,9 +63,15 @@ def train_one_epoch(
     device: torch.device,
     scheduler=None,
     desc: str = "Training",
+    use_amp: bool = False,
+    scaler=None,
 ) -> float:
     """One training epoch. Steps `scheduler` after every iteration when given. Returns mean loss."""
     model.train()
+    amp_enabled = use_amp and device.type == "cuda"
+    if scaler is None and amp_enabled:
+        scaler = torch.amp.GradScaler("cuda")
+
     total_loss, total_images = 0.0, 0
     progress = tqdm(loader, desc)
     for images, targets in progress:
@@ -73,9 +79,15 @@ def train_one_epoch(
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        loss = criterion(model(inputs), targets)
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast("cuda", enabled=amp_enabled):
+            loss = criterion(model(inputs), targets)
+        if scaler is not None and amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
         if scheduler is not None:
             scheduler.step()
 
@@ -94,6 +106,7 @@ def predict_probs(
     criterion: nn.Module | None = None,
     desc: str | None = None,
     leave: bool = True,
+    use_amp: bool = False,
 ):
     """Run the classifier over a loader in eval mode.
 
@@ -102,16 +115,18 @@ def predict_probs(
     `criterion` is given.
     """
     model.eval()
+    amp_enabled = use_amp and device.type == "cuda"
     probs_list, targets_list = [], []
     total_loss, total_images = 0.0, 0
     iterator = tqdm(loader, desc=desc, leave=leave) if desc else loader
     for images, targets in iterator:
-        logits = model(normalize_batch(images).to(device, non_blocking=True))
-        if criterion is not None:
-            loss = criterion(logits, targets.to(device, non_blocking=True))
-            total_loss += loss.item() * images.size(0)
-            total_images += images.size(0)
-        probs_list.append(torch.sigmoid(logits).cpu())
+        with torch.amp.autocast("cuda", enabled=amp_enabled):
+            logits = model(normalize_batch(images).to(device, non_blocking=True))
+            if criterion is not None:
+                loss = criterion(logits, targets.to(device, non_blocking=True))
+                total_loss += loss.item() * images.size(0)
+                total_images += images.size(0)
+        probs_list.append(torch.sigmoid(logits.float()).cpu())
         targets_list.append(targets.cpu())
 
     probs = torch.cat(probs_list, dim=0).numpy()
