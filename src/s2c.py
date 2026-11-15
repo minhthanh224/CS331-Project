@@ -110,7 +110,10 @@ def build_sam_amg(
     crop_n_layers: int = 0,
 ):
     """Build a `SamAutomaticMaskGenerator` configured for fast WSSS segment caching."""
-    from segment_anything import SamAutomaticMaskGenerator
+    try:
+        from segment_anything import SamAutomaticMaskGenerator
+    except ImportError:
+        from mobile_sam import SamAutomaticMaskGenerator
 
     return SamAutomaticMaskGenerator(
         model=sam_model,
@@ -150,9 +153,13 @@ def _encode_sam_images_chunked(
     max_chunk_size: int | None = None,
 ) -> tuple[torch.Tensor, list[tuple[int, int]], list[tuple[int, int]], int]:
     """Batch-run SAM's heavy ViT image_encoder in AMP with automatic CUDA OOM batch-size backoff."""
-    from segment_anything.utils.transforms import ResizeLongestSide
+    try:
+        from segment_anything.utils.transforms import ResizeLongestSide
+    except ImportError:
+        from mobile_sam.utils.transforms import ResizeLongestSide
 
-    resize_tf = ResizeLongestSide(sam_model.image_encoder.img_size)
+    enc_img_size = int(getattr(sam_model.image_encoder, "img_size", 1024))
+    resize_tf = ResizeLongestSide(enc_img_size)
     resized_cpu: list[np.ndarray] = []
     orig_sizes: list[tuple[int, int]] = []
     input_sizes: list[tuple[int, int]] = []
@@ -223,7 +230,10 @@ def _decode_amg_segment_map_gpu(
     amp_dtype: torch.dtype | None = None,
 ) -> np.ndarray:
     """Decode SAM grid prompts directly to a `(H, W)` uint8 segment map on GPU without RLE round-trips."""
-    from segment_anything.utils.amg import batched_mask_to_box, calculate_stability_score
+    try:
+        from segment_anything.utils.amg import batched_mask_to_box, calculate_stability_score
+    except ImportError:
+        from mobile_sam.utils.amg import batched_mask_to_box, calculate_stability_score
 
     device = image_embedding.device
     H, W = original_size
@@ -393,7 +403,10 @@ def cache_sam_segments(
             generated += 1
         return {"generated": generated, "skipped": skipped, "total": len(image_ids)}
 
-    from segment_anything.utils.amg import build_all_layer_point_grids
+    try:
+        from segment_anything.utils.amg import build_all_layer_point_grids
+    except ImportError:
+        from mobile_sam.utils.amg import build_all_layer_point_grids
 
     device = next(sam_model.parameters()).device
     amp_dtype = _auto_sam_amp_dtype(device, use_amp=use_amp)
@@ -494,12 +507,16 @@ def generate_cpm_pseudo_masks(
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
     ])
-    sam_cfg = dict(sam_params or {})
-    sam_cfg.setdefault("cam_threshold", 0.22)
-    sam_cfg.setdefault("low_threshold", 0.10)
-    sam_cfg.setdefault("bg_threshold", 0.04)
-    sam_cfg.setdefault("use_neg_points", True)
-    sam_cfg.setdefault("box_pad", 20)
+    is_layercam = cam_method.lower() == "layercam"
+    sam_cfg = {
+        "cam_threshold": 0.28 if is_layercam else 0.22,
+        "low_threshold": 0.18 if is_layercam else 0.10,
+        "bg_threshold": 0.06 if is_layercam else 0.04,
+        "use_neg_points": True,
+        "box_pad": 16 if is_layercam else 20,
+    }
+    if sam_params:
+        sam_cfg.update(sam_params)
 
     was_training = model.training
     model.eval()
@@ -712,7 +729,7 @@ def sam_segment_contrasting_loss(
     temperature: float = 0.1,
     min_pixels: int = 2,
 ) -> torch.Tensor:
-    """SSC loss: segment-balanced InfoNCE pulling pixel features to their SAM segment prototype."""
+    """SSC loss: pixel-wise InfoNCE pulling pixel features to detached SAM segment prototypes."""
     proj_feats = proj_feats.float()
     if seg_map.shape[-2:] != proj_feats.shape[-2:]:
         seg_map = F.interpolate(
@@ -723,6 +740,7 @@ def sam_segment_contrasting_loss(
 
     B, D, _, _ = proj_feats.shape
     losses = []
+    temp = max(float(temperature), 1e-4)
 
     for b in range(B):
         seg_b = seg_map[b].reshape(-1)
@@ -743,19 +761,15 @@ def sam_segment_contrasting_loss(
         target_idx = remap[inv_idx[keep_pixel]]
 
         f_b = proj_feats[b].permute(1, 2, 0).reshape(-1, D)[valid_mask][keep_pixel]
-        f_b = F.normalize(f_b, dim=-1)
+        f_b = F.normalize(f_b, dim=-1, eps=1e-6)
 
         proto_sum = torch.zeros((num_kept, D), dtype=f_b.dtype, device=f_b.device)
-        proto_sum.index_add_(0, target_idx, f_b)
+        proto_sum.index_add_(0, target_idx, f_b.detach())
         seg_counts = torch.bincount(target_idx, minlength=num_kept).clamp_min(1).to(f_b.dtype)
-        protos = F.normalize(proto_sum / seg_counts.unsqueeze(1), dim=-1)
+        protos = F.normalize(proto_sum / seg_counts.unsqueeze(1), dim=-1, eps=1e-6)
 
-        sim_logits = torch.matmul(f_b, protos.T) / float(temperature)
-        pix_ce = F.cross_entropy(sim_logits, target_idx, reduction="none")
-
-        seg_ce_sum = torch.zeros((num_kept,), dtype=pix_ce.dtype, device=pix_ce.device)
-        seg_ce_sum.index_add_(0, target_idx, pix_ce)
-        losses.append((seg_ce_sum / seg_counts).mean())
+        sim_logits = torch.matmul(f_b, protos.T) / temp
+        losses.append(F.cross_entropy(sim_logits, target_idx, reduction="mean"))
 
     if not losses:
         return proj_feats.sum() * 0.0
@@ -766,40 +780,66 @@ def cpm_pseudo_mask_loss(
     feat_map: torch.Tensor,
     model: nn.Module,
     cpm_masks: torch.Tensor,
-    image_targets: torch.Tensor,
+    image_targets: torch.Tensor | None = None,
     ignore_index: int = IGNORE_INDEX,
 ) -> torch.Tensor:
-    """CPM loss: supervise dense spatial classifier logits against SAM-refined pseudo-masks."""
-    feat_f32 = feat_map.float()
-    if cpm_masks.shape[-2:] != feat_f32.shape[-2:]:
-        cpm_masks = F.interpolate(
-            cpm_masks.unsqueeze(1).float(),
-            size=feat_f32.shape[-2:],
-            mode="nearest",
-        ).squeeze(1).long()
+    """Compute S2C CAM Pseudo-Mask supervision loss (L_CPM) using official ReLU max-norm formulation.
 
+    1. Project spatial features with classifier weight (no bias):
+       ``raw_cam = conv1x1(feat_map, weight)`` ``[B, C, H_f, W_f]``
+    2. Upsample ``raw_cam`` to ``cpm_masks`` resolution ``(H_m, W_m)`` if needed.
+    3. Apply ``ReLU`` + per-class spatial max-normalization masked by ``image_targets``:
+       ``cam_fg = ReLU(raw_cam) * present_mask``
+       ``cam_fg = (cam_fg / (adaptive_max_pool2d(cam_fg, 1) + 1e-5)) * present_mask``
+    4. Construct background score as complement of max foreground activation:
+       ``cam_bg = 1.0 - max_c(cam_fg)``
+    5. Cross-entropy over ``[cam_bg, cam_fg]`` (C + 1 classes) with ``ignore_index=255``.
+    Because ReLU clips negative values at 0, background pixels with raw activation <= 0
+    already yield ``cam_fg = 0`` and ``cam_bg = 1`` without negative gradient fighting ``L_CLS``.
+    """
     head = get_classifier_head(model)
-    bias = head.bias.float() if head.bias is not None else None
-    fg_logits = F.conv2d(feat_f32, head.weight.float()[:, :, None, None], bias=bias)
+    feat_f32 = feat_map.float()
+    raw_cam = F.conv2d(feat_f32, head.weight.float()[:, :, None, None], bias=None)
 
-    absent = (image_targets <= 0.5)[:, :, None, None]
-    fg_logits = fg_logits.masked_fill(absent, -1e4)
-    bg_logit = torch.zeros_like(fg_logits[:, :1])
-    seg_logits = torch.cat([bg_logit, fg_logits], dim=1)
+    target_hw = (cpm_masks.shape[-2], cpm_masks.shape[-1])
+    if raw_cam.shape[-2:] != target_hw:
+        raw_cam = F.interpolate(
+            raw_cam,
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        )
 
-    safe_targets = cpm_masks.clone()
-    fg_pos = (safe_targets > 0) & (safe_targets != ignore_index)
-    if fg_pos.any():
-        b_idx, y_idx, x_idx = torch.where(fg_pos)
-        cls_idx = safe_targets[b_idx, y_idx, x_idx] - 1
-        invalid_fg = image_targets[b_idx, cls_idx] <= 0.5
-        if invalid_fg.any():
-            safe_targets[b_idx[invalid_fg], y_idx[invalid_fg], x_idx[invalid_fg]] = ignore_index
+    if image_targets is not None:
+        present = (image_targets > 0.5).to(raw_cam.dtype)[:, :, None, None]
+    else:
+        present = torch.ones(
+            (raw_cam.shape[0], raw_cam.shape[1], 1, 1),
+            dtype=raw_cam.dtype,
+            device=raw_cam.device,
+        )
+
+    cam_fg = F.relu(raw_cam) * present
+    cam_max = F.adaptive_max_pool2d(cam_fg, (1, 1))
+    cam_fg = (cam_fg / (cam_max + 1e-5)) * present
+
+    cam_bg = 1.0 - cam_fg.max(dim=1, keepdim=True)[0]
+    seg_scores = torch.cat([cam_bg, cam_fg], dim=1)  # [B, C + 1, H_m, W_m]
+
+    safe_targets = cpm_masks.long().clone()
+    if image_targets is not None:
+        fg_pos = (safe_targets > 0) & (safe_targets != ignore_index)
+        if fg_pos.any():
+            b_idx, y_idx, x_idx = torch.where(fg_pos)
+            cls_idx = safe_targets[b_idx, y_idx, x_idx] - 1
+            invalid_fg = image_targets[b_idx, cls_idx] <= 0.5
+            if invalid_fg.any():
+                safe_targets[b_idx[invalid_fg], y_idx[invalid_fg], x_idx[invalid_fg]] = ignore_index
 
     if not (safe_targets != ignore_index).any():
         return feat_f32.sum() * 0.0
 
-    return F.cross_entropy(seg_logits, safe_targets, ignore_index=ignore_index)
+    return F.cross_entropy(seg_scores, safe_targets, ignore_index=ignore_index)
 
 
 def build_s2c_optimizer(

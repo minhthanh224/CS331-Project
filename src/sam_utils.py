@@ -14,6 +14,11 @@ if TYPE_CHECKING:  # segment_anything is only needed at runtime by build_sam_pre
 
 # model type -> (checkpoint file name, download URL, minimum valid size in bytes)
 SAM_MODEL_SPECS = {
+    "vit_t": (
+        "mobile_sam.pt",
+        "https://raw.githubusercontent.com/ChaoningZhang/MobileSAM/master/weights/mobile_sam.pt",
+        38_000_000,
+    ),
     "vit_b": (
         "sam_vit_b_01ec64.pth",
         "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
@@ -65,12 +70,46 @@ def ensure_sam_checkpoint(model_type: str, target_dir, cache_dirs=()) -> Path:
     return local_path
 
 
-def build_sam_predictor(model_type: str, checkpoint_path, device) -> "SamPredictor":
-    """Load a SAM model from `checkpoint_path`, move it to `device` (eval mode) and wrap it in a SamPredictor."""
-    from segment_anything import SamPredictor, sam_model_registry
+def load_sam_model(model_type: str, checkpoint_path, device):
+    """Load a SAM or MobileSAM (`vit_t`) model from `checkpoint_path` onto `device` in eval mode."""
+    if model_type not in SAM_MODEL_SPECS:
+        raise ValueError(
+            f"Unsupported SAM model_type={model_type!r}. Expected one of {tuple(SAM_MODEL_SPECS)}."
+        )
+
+    if model_type == "vit_t":
+        try:
+            from mobile_sam import sam_model_registry
+        except ImportError as exc:
+            try:
+                from segment_anything import sam_model_registry as sa_registry
+            except ImportError:
+                sa_registry = {}
+            if "vit_t" in sa_registry:
+                sam_model_registry = sa_registry
+            else:
+                raise ImportError(
+                    "MobileSAM ('vit_t') requires the 'mobile_sam' package: "
+                    "pip install git+https://github.com/ChaoningZhang/MobileSAM.git"
+                ) from exc
+    else:
+        from segment_anything import sam_model_registry
 
     sam = sam_model_registry[model_type](checkpoint=str(checkpoint_path))
     sam.to(device=device).eval()
+    return sam
+
+
+def build_sam_predictor(model_type: str, checkpoint_path, device) -> "SamPredictor":
+    """Load a SAM or MobileSAM model from `checkpoint_path`, move it to `device` (eval mode), and wrap it in a SamPredictor."""
+    sam = load_sam_model(model_type, checkpoint_path, device)
+    if model_type == "vit_t":
+        try:
+            from mobile_sam import SamPredictor
+        except ImportError:
+            from segment_anything import SamPredictor
+    else:
+        from segment_anything import SamPredictor
     return SamPredictor(sam)
 
 

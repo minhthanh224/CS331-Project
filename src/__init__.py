@@ -92,6 +92,7 @@ from .sam_utils import (
     ensure_sam_checkpoint,
     gen_sam_pseudo_mask,
     get_sam_embedding,
+    load_sam_model,
     set_sam_embedding,
 )
 from .utils import (
@@ -168,6 +169,7 @@ __all__ = [
     "get_dense_crf_mask",
     "SAM_MODEL_SPECS",
     "ensure_sam_checkpoint",
+    "load_sam_model",
     "build_sam_predictor",
     "get_sam_embedding",
     "set_sam_embedding",
