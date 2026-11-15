@@ -650,6 +650,12 @@ def generate_cpm_pseudo_masks(
             fut.result()
     pbar.close()
 
+    if hasattr(predictor, "reset_image"):
+        predictor.reset_image()
+    else:
+        predictor.features = None
+        predictor.is_image_set = False
+
     if was_training:
         model.train()
     return {"generated": generated, "skipped": skipped, "total": len(image_ids)}
