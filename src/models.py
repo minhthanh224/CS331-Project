@@ -64,8 +64,9 @@ def build_classifier(
     model_name: str = "resnet18",
     num_classes: int = 20,
     layer4_stride1: bool = False,
+    pretrained: bool = True,
 ) -> nn.Module:
-    """Build a pretrained classifier with a fresh `num_classes` head.
+    """Build a classifier with a fresh `num_classes` head (ImageNet-pretrained by default).
 
     `layer4_stride1` applies to ResNet's `layer4[0]` and to ConvNeXt's last downsample stage
     (2x higher-resolution feature maps, useful for CAM). Pretrained weights are unaffected because
@@ -75,7 +76,7 @@ def build_classifier(
         raise ValueError(f"model_name must be one of {list(MODEL_REGISTRY)}, got: {model_name}")
 
     model_fn, weights = MODEL_REGISTRY[model_name]
-    model = model_fn(weights=weights)
+    model = model_fn(weights=weights if pretrained else None)
 
     if model_name in CONVNEXT_MODEL_NAMES:
         if layer4_stride1:
@@ -99,16 +100,31 @@ def build_classifier(
     return model
 
 
+def _infer_num_classes_from_state(state: dict) -> int | None:
+    """Infer output class count from a classifier state_dict's final Linear weight."""
+    if "fc.weight" in state:
+        return int(state["fc.weight"].shape[0])
+    classifier_weights = [
+        (k, v) for k, v in state.items()
+        if k.startswith("classifier.") and k.endswith(".weight") and v.ndim == 2
+    ]
+    if classifier_weights:
+        classifier_weights.sort(key=lambda item: item[0])
+        return int(classifier_weights[-1][1].shape[0])
+    return None
+
+
 def load_classifier(
     model_name: str,
     checkpoint_path,
     device="cpu",
-    num_classes: int = 20,
+    num_classes: int | None = None,
     layer4_stride1: bool | None = None,
 ) -> nn.Module:
     """Build a classifier, load a checkpoint into it and return it in eval mode on `device`.
 
     Accepts both a plain state_dict file and a training payload with a "model_state_dict" key.
+    When `num_classes is None`, infers class count from payload metadata or head weights (default 20).
     When `layer4_stride1 is None`, automatically reads `config["layer4_stride1"]` from payload
     checkpoints if available (defaulting to False for plain state_dict files).
     """
@@ -116,15 +132,24 @@ def load_classifier(
 
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "model_state_dict" in state:
+        if num_classes is None:
+            if "num_classes" in state and state["num_classes"] is not None:
+                num_classes = int(state["num_classes"])
+            elif isinstance(state.get("classes"), (list, tuple)):
+                num_classes = len(state["classes"])
         if layer4_stride1 is None:
             cfg = state.get("config")
             if isinstance(cfg, dict) and "layer4_stride1" in cfg:
                 layer4_stride1 = bool(cfg["layer4_stride1"])
         state = state["model_state_dict"]
 
+    if num_classes is None:
+        inferred = _infer_num_classes_from_state(state) if isinstance(state, dict) else None
+        num_classes = inferred if inferred is not None else 20
+
     if layer4_stride1 is None:
         layer4_stride1 = False
 
-    model = build_classifier(model_name, num_classes=num_classes, layer4_stride1=layer4_stride1)
+    model = build_classifier(model_name, num_classes=num_classes, layer4_stride1=layer4_stride1, pretrained=False)
     model.load_state_dict(state)
     return model.to(device).eval()
