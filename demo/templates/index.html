@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ResNet-101 WSSS Demo — Phân loại &amp; Phân đoạn ảnh</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-badge">R101</div>
+        <div>
+          <h1>ResNet-101 WSSS Web Demo</h1>
+          <p class="subtitle">Multi-label Classification · CAM / LayerCAM · DenseCRF · SAM (ViT-B)</p>
+        </div>
+      </div>
+      <div class="status-pills" id="statusPills">
+        <span class="pill pill-muted">Đang kiểm tra mô hình...</span>
+      </div>
+    </header>
+
+    <main class="main-grid">
+      <!-- Left column: Upload & Controls -->
+      <aside class="sidebar">
+        <section class="card">
+          <h2 class="card-title">1. Chọn hoặc kéo thả ảnh</h2>
+          <div id="dropZone" class="drop-zone" tabindex="0" role="button" aria-label="Chọn hoặc kéo thả ảnh vào đây">
+            <input type="file" id="fileInput" accept="image/*" hidden />
+            <div class="drop-icon" aria-hidden="true">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+            </div>
+            <p class="drop-primary">Kéo thả ảnh mới vào đây</p>
+            <p class="drop-secondary">hoặc <span class="link-like">nhấn để chọn tệp</span> · Hỗ trợ dán ảnh (<kbd>Ctrl+V</kbd>)</p>
+            <p class="drop-hint">JPG, PNG, WEBP (tối đa 20 MB)</p>
+          </div>
+
+          <div id="previewBar" class="preview-bar hidden">
+            <img id="previewThumb" alt="Ảnh đã chọn" />
+            <div class="preview-meta">
+              <div id="previewName" class="preview-name">image.jpg</div>
+              <div id="previewInfo" class="preview-info">—</div>
+            </div>
+            <button type="button" id="clearBtn" class="btn-icon" title="Chọn ảnh khác">✕</button>
+          </div>
+
+          <div id="samplesWrap" class="samples-wrap hidden">
+            <div class="samples-label">Hoặc thử nhanh ảnh mẫu Pascal VOC:</div>
+            <div id="samplesGrid" class="samples-grid"></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">2. Tham số suy luận</h2>
+
+          <div class="control-group">
+            <label class="control-label">Phương pháp CAM</label>
+            <div class="segmented" id="camMethodGroup">
+              <button type="button" class="seg-btn active" data-method="cam">Vanilla CAM</button>
+              <button type="button" class="seg-btn" data-method="layercam">LayerCAM</button>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <div class="label-row">
+              <label for="clsThreshold">Ngưỡng phân loại (cls_threshold)</label>
+              <span id="clsThresholdVal" class="val-badge">0.50</span>
+            </div>
+            <input type="range" id="clsThreshold" min="0.05" max="0.95" step="0.05" value="0.50" />
+          </div>
+
+          <div class="control-group">
+            <div class="label-row">
+              <label for="camThreshold">Ngưỡng CAM (cam_threshold)</label>
+              <span id="camThresholdVal" class="val-badge">0.25</span>
+            </div>
+            <input type="range" id="camThreshold" min="0.05" max="0.85" step="0.05" value="0.25" />
+          </div>
+
+          <div class="control-group">
+            <div class="label-row">
+              <label for="crfAlpha">DenseCRF alpha</label>
+              <span id="crfAlphaVal" class="val-badge">2.0</span>
+            </div>
+            <input type="range" id="crfAlpha" min="0.5" max="8.0" step="0.5" value="2.0" />
+          </div>
+
+          <div class="toggles">
+            <label class="toggle-item">
+              <input type="checkbox" id="useTta" />
+              <span>Multi-scale + Flip TTA (0.75, 1.0, 1.25)</span>
+            </label>
+            <label class="toggle-item">
+              <input type="checkbox" id="useCrf" checked />
+              <span>Bật hậu xử lý DenseCRF</span>
+            </label>
+            <label class="toggle-item" id="samToggleLabel">
+              <input type="checkbox" id="useSam" checked />
+              <span>Bật tinh chỉnh SAM (ViT-B)</span>
+            </label>
+          </div>
+
+          <button type="button" id="runBtn" class="btn-primary" disabled>
+            <span id="runBtnText">Phân tích ảnh với ResNet-101</span>
+          </button>
+        </section>
+      </aside>
+
+      <!-- Right column: Results -->
+      <section class="results-col">
+        <div id="emptyState" class="card empty-state">
+          <div class="empty-art">🖼️</div>
+          <h3>Chưa có ảnh nào được phân tích</h3>
+          <p>Hãy kéo thả hoặc chọn một ảnh bất kỳ ở khung bên trái. Hệ thống sẽ dùng <strong>ResNet-101</strong> để nhận diện các đối tượng thuộc 20 lớp Pascal VOC, sinh bản đồ kích hoạt (CAM / LayerCAM) và tạo pseudo-mask phân đoạn.</p>
+        </div>
+
+        <div id="loadingBanner" class="card loading-banner hidden">
+          <div class="spinner"></div>
+          <div>
+            <div class="loading-title">Đang chạy ResNet-101 &amp; tạo bản đồ phân đoạn...</div>
+            <div class="loading-sub">Lần đầu nạp trọng số có thể mất 1–2 giây.</div>
+          </div>
+        </div>
+
+        <div id="errorBanner" class="card error-banner hidden"></div>
+
+        <div id="resultsContainer" class="results-stack hidden">
+          <!-- Classification summary -->
+          <section class="card">
+            <div class="card-header-row">
+              <div>
+                <h2 class="card-title">Kết quả nhận diện lớp (ResNet-101 Multi-label)</h2>
+                <p id="clsSubtitle" class="card-sub"></p>
+              </div>
+              <div id="timingBadges" class="timing-badges"></div>
+            </div>
+
+            <div id="activePills" class="active-pills"></div>
+
+            <details class="all-probs-details">
+              <summary>Xem xác suất toàn bộ 20 lớp Pascal VOC</summary>
+              <div id="allProbsList" class="probs-grid"></div>
+            </details>
+          </section>
+
+          <!-- Visual comparison -->
+          <section class="card">
+            <div class="card-header-row">
+              <div>
+                <h2 class="card-title">Trực quan hóa Heatmap &amp; Pseudo-Mask</h2>
+                <p class="card-sub">Nhấn vào từng khung ảnh để phóng to. Dùng thanh trượt bên phải để chỉnh độ mờ lớp phủ mask.</p>
+              </div>
+              <div class="overlay-controls">
+                <label class="inline-range">
+                  <span>Độ mờ Mask: <strong id="maskOpacityVal">65%</strong></span>
+                  <input type="range" id="maskOpacity" min="0.1" max="1.0" step="0.05" value="0.65" />
+                </label>
+                <label class="toggle-chip">
+                  <input type="checkbox" id="pureMaskMode" />
+                  <span>Chỉ hiện Mask</span>
+                </label>
+              </div>
+            </div>
+
+            <div id="perClassSelector" class="per-class-bar hidden">
+              <span class="per-class-label">Heatmap CAM theo lớp:</span>
+              <div id="perClassButtons" class="per-class-buttons"></div>
+            </div>
+
+            <div class="visual-grid" id="visualGrid">
+              <figure class="vis-card" data-zoom="original">
+                <div class="vis-frame">
+                  <img id="imgOriginal" alt="Ảnh gốc" />
+                </div>
+                <figcaption>
+                  <span>Ảnh gốc</span>
+                  <span id="imgDims" class="cap-meta"></span>
+                </figcaption>
+              </figure>
+
+              <figure class="vis-card" data-zoom="cam">
+                <div class="vis-frame">
+                  <img id="imgCam" alt="CAM Heatmap Overlay" />
+                </div>
+                <figcaption>
+                  <span id="camCaption">CAM Overlay (Max)</span>
+                  <span class="cap-meta" id="camMethodTag">CAM</span>
+                </figcaption>
+              </figure>
+
+              <figure class="vis-card" data-zoom="vanilla">
+                <div class="vis-frame mask-stage">
+                  <img class="stage-base" id="baseVanilla" alt="" />
+                  <img class="stage-mask" id="maskVanilla" alt="Vanilla CAM Mask" />
+                </div>
+                <figcaption>
+                  <span>Vanilla CAM Mask</span>
+                  <span class="cap-meta">Threshold</span>
+                </figcaption>
+              </figure>
+
+              <figure class="vis-card" id="cardCrf" data-zoom="crf">
+                <div class="vis-frame mask-stage">
+                  <img class="stage-base" id="baseCrf" alt="" />
+                  <img class="stage-mask" id="maskCrf" alt="CAM + DenseCRF Mask" />
+                </div>
+                <figcaption>
+                  <span>CAM + DenseCRF</span>
+                  <span class="cap-meta">Mean-Field</span>
+                </figcaption>
+              </figure>
+
+              <figure class="vis-card" id="cardSam" data-zoom="sam">
+                <div class="vis-frame mask-stage">
+                  <img class="stage-base" id="baseSam" alt="" />
+                  <img class="stage-mask" id="maskSam" alt="CAM + SAM Mask" />
+                </div>
+                <figcaption>
+                  <span>CAM + SAM (ViT-B)</span>
+                  <span class="cap-meta">CC + MultiMask</span>
+                </figcaption>
+              </figure>
+            </div>
+
+            <div class="legend-section">
+              <div class="legend-title">Chú thích màu &amp; Tỷ lệ diện tích đối tượng (theo mask tốt nhất):</div>
+              <div id="legendList" class="legend-list"></div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Lightbox Modal -->
+  <div id="lightbox" class="lightbox hidden" role="dialog" aria-modal="true">
+    <div class="lightbox-backdrop"></div>
+    <div class="lightbox-body">
+      <div class="lightbox-head">
+        <span id="lightboxTitle">Chi tiết</span>
+        <button type="button" id="lightboxClose" class="btn-icon">✕</button>
+      </div>
+      <div class="lightbox-stage">
+        <img id="lightboxBase" class="hidden" alt="" />
+        <img id="lightboxImg" alt="Phóng to" />
+      </div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
+
