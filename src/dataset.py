@@ -154,18 +154,20 @@ def decode_coco_rle(rle: dict, height: int | None = None, width: int | None = No
 def decode_coco_ann_mask(ann: dict, height: int, width: int) -> np.ndarray:
     """Decode one COCO instance annotation (polygon list or RLE dict) into a `(H, W)` bool mask."""
     seg = ann["segmentation"]
-    if _coco_mask_api is not None:
-        rles = _coco_mask_api.frPyObjects(seg, height, width) if isinstance(seg, list) else seg
-        if isinstance(rles, list):
-            decoded = _coco_mask_api.decode(_coco_mask_api.merge(rles))
-        else:
-            decoded = _coco_mask_api.decode(rles)
-        return decoded.astype(bool)
-
     if isinstance(seg, dict):
         return decode_coco_rle(seg, height=height, width=width)
 
     if isinstance(seg, list):
+        if not seg:
+            return np.zeros((height, width), dtype=bool)
+        if _coco_mask_api is not None:
+            rles = _coco_mask_api.frPyObjects(seg, height, width)
+            if isinstance(rles, list):
+                decoded = _coco_mask_api.decode(_coco_mask_api.merge(rles))
+            else:
+                decoded = _coco_mask_api.decode(rles)
+            return decoded.astype(bool)
+
         canvas = Image.new("L", (width, height), 0)
         draw = ImageDraw.Draw(canvas)
         for poly in seg:
